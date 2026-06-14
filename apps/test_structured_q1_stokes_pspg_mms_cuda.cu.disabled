@@ -1,0 +1,756 @@
+#include "memoirs/diagnostics/GpuMemoryMonitor.hpp"
+#include "memoirs/diagnostics/CudaTiming.hpp"
+#include "memoirs/diagnostics/StructuredQ1StokesErrorDiagnostics.hpp"
+#include "memoirs/gpu/StructuredGmgCuda.cuh"
+#include "memoirs/solvers/CudaBicgstabRight.hpp"
+
+#include <cuda_runtime.h>
+
+#include <cmath>
+#include <cstdlib>
+#include <iomanip>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#if defined(MEMOIRS_PRECISION_single)
+using Real = float;
+static constexpr const char* kPrecisionName = "single";
+#else
+using Real = double;
+static constexpr const char* kPrecisionName = "double";
+#endif
+
+namespace {
+
+struct Cli {
+    int nElem = 16;
+    int maxit = 1000;
+    double tol = 1e-10;
+    double nu = 1.0;
+    double tauScale = 0.25;
+    int printEvery = 25;
+    int repeats = 1;
+};
+
+static int arg_int(int& i, int argc, char** argv) {
+    if (i + 1 >= argc) throw std::runtime_error("missing integer argument");
+    return std::atoi(argv[++i]);
+}
+
+static double arg_double(int& i, int argc, char** argv) {
+    if (i + 1 >= argc) throw std::runtime_error("missing floating argument");
+    return std::atof(argv[++i]);
+}
+
+static Cli parse_cli(int argc, char** argv) {
+    Cli c;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string a(argv[i]);
+
+        if (a == "-n" || a == "-nElem") c.nElem = arg_int(i, argc, argv);
+        else if (a == "-maxit") c.maxit = arg_int(i, argc, argv);
+        else if (a == "-tol") c.tol = arg_double(i, argc, argv);
+        else if (a == "-nu") c.nu = arg_double(i, argc, argv);
+        else if (a == "-tauScale") c.tauScale = arg_double(i, argc, argv);
+        else if (a == "-printEvery") c.printEvery = arg_int(i, argc, argv);
+        else if (a == "-repeats") c.repeats = arg_int(i, argc, argv);
+        else throw std::runtime_error("unknown argument: " + a);
+    }
+
+    if (c.nElem < 2) throw std::runtime_error("-n must be >= 2");
+    if (c.repeats < 1) throw std::runtime_error("-repeats must be >= 1");
+
+    return c;
+}
+
+} // namespace
+
+namespace memoirs {
+namespace gpu {
+
+template <class Real>
+__device__ inline Real stokes_local_ke_q1(const Grid3DCuda g,
+                                          int ra,
+                                          int ca) {
+    const int rix = ra & 1;
+    const int riy = (ra >> 1) & 1;
+    const int riz = (ra >> 2) & 1;
+
+    const int cix = ca & 1;
+    const int ciy = (ca >> 1) & 1;
+    const int ciz = (ca >> 2) & 1;
+
+    const Real M[2][2] = {
+        {Real(2.0 / 3.0), Real(1.0 / 3.0)},
+        {Real(1.0 / 3.0), Real(2.0 / 3.0)}
+    };
+
+    const Real K[2][2] = {
+        {Real(0.5), Real(-0.5)},
+        {Real(-0.5), Real(0.5)}
+    };
+
+    const Real hx = Real(g.hx);
+    const Real hy = Real(g.hy);
+    const Real hz = Real(g.hz);
+
+    const Real cx = hy * hz / (Real(2) * hx);
+    const Real cy = hx * hz / (Real(2) * hy);
+    const Real cz = hx * hy / (Real(2) * hz);
+
+    return
+        cx * K[rix][cix] * M[riy][ciy] * M[riz][ciz] +
+        cy * M[rix][cix] * K[riy][ciy] * M[riz][ciz] +
+        cz * M[rix][cix] * M[riy][ciy] * K[riz][ciz];
+}
+
+__device__ inline int stokes_local_node_id(const Grid3DCuda g,
+                                           int ex,
+                                           int ey,
+                                           int ez,
+                                           int a) {
+    const int ix = a & 1;
+    const int iy = (a >> 1) & 1;
+    const int iz = (a >> 2) & 1;
+    return g_id(g, ex + ix, ey + iy, ez + iz);
+}
+
+template <class Real>
+__device__ inline Real stokes_local_b_q1(const Grid3DCuda g,
+                                         int qa,
+                                         int ub,
+                                         int comp) {
+    const Real gp = Real(0.577350269189625764509148780501957456);
+    const Real q[2] = { -gp, gp };
+
+    const Real hx = Real(g.hx);
+    const Real hy = Real(g.hy);
+    const Real hz = Real(g.hz);
+
+    const Real jac = hx * hy * hz / Real(8);
+
+    Real val = Real(0);
+
+    for (int iq = 0; iq < 2; ++iq) {
+        const Real xi = q[iq];
+        const Real Nx[2] = {
+            Real(0.5) * (Real(1) - xi),
+            Real(0.5) * (Real(1) + xi)
+        };
+        const Real dNx_dxi[2] = { Real(-0.5), Real(0.5) };
+
+        for (int jq = 0; jq < 2; ++jq) {
+            const Real eta = q[jq];
+            const Real Ny[2] = {
+                Real(0.5) * (Real(1) - eta),
+                Real(0.5) * (Real(1) + eta)
+            };
+            const Real dNy_deta[2] = { Real(-0.5), Real(0.5) };
+
+            for (int kq = 0; kq < 2; ++kq) {
+                const Real zeta = q[kq];
+                const Real Nz[2] = {
+                    Real(0.5) * (Real(1) - zeta),
+                    Real(0.5) * (Real(1) + zeta)
+                };
+                const Real dNz_dzeta[2] = { Real(-0.5), Real(0.5) };
+
+                const int qx = qa & 1;
+                const int qy = (qa >> 1) & 1;
+                const int qz = (qa >> 2) & 1;
+
+                const int ux = ub & 1;
+                const int uy = (ub >> 1) & 1;
+                const int uz = (ub >> 2) & 1;
+
+                const Real Na = Nx[qx] * Ny[qy] * Nz[qz];
+
+                Real dNb = Real(0);
+                if (comp == 0) {
+                    dNb = dNx_dxi[ux] * (Real(2) / hx) * Ny[uy] * Nz[uz];
+                } else if (comp == 1) {
+                    dNb = Nx[ux] * dNy_deta[uy] * (Real(2) / hy) * Nz[uz];
+                } else {
+                    dNb = Nx[ux] * Ny[uy] * dNz_dzeta[uz] * (Real(2) / hz);
+                }
+
+                val += Na * dNb * jac;
+            }
+        }
+    }
+
+    return val;
+}
+
+__device__ inline void stokes_mms_force(double x,
+                                        double y,
+                                        double z,
+                                        double nu,
+                                        double& fx,
+                                        double& fy,
+                                        double& fz) {
+    const double pi = 3.141592653589793238462643383279502884;
+
+    const double sx = sin(pi * x);
+    const double sy = sin(pi * y);
+    const double sz = sin(pi * z);
+
+    const double cx = cos(pi * x);
+    const double cy = cos(pi * y);
+    const double cz = cos(pi * z);
+
+    const double c2x = cos(2.0 * pi * x);
+    const double c2y = cos(2.0 * pi * y);
+    const double c2z = cos(2.0 * pi * z);
+
+    const double A = sx * sx;
+    const double B = sy * cy;
+    const double C = sz * sz;
+
+    const double D = sx * cx;
+    const double E = sy * sy;
+
+    const double lap_u =
+        4.0 * pi * pi * pi * B *
+        (c2x * C - 2.0 * A * C + A * c2z);
+
+    const double lap_v =
+        8.0 * pi * pi * pi * D * E * C
+        - 4.0 * pi * pi * pi * D * c2y * C
+        - 4.0 * pi * pi * pi * D * E * c2z;
+
+    const double px = pi * cx * sy * sz;
+    const double py = pi * sx * cy * sz;
+    const double pz = pi * sx * sy * cz;
+
+    fx = -nu * lap_u + px;
+    fy = -nu * lap_v + py;
+    fz = pz;
+}
+
+template <class Real>
+__global__ void kernel_apply_stokes_pspg(Grid3DCuda g,
+                                         Real nu,
+                                         Real tau,
+                                         const Real* x,
+                                         Real* y) {
+    const int nn = g.n_nodes_host();
+    const int total = 4 * nn;
+
+    const int block = 256;
+    for (int q = blockIdx.x * blockDim.x + threadIdx.x;
+         q < total;
+         q += blockDim.x * gridDim.x) {
+        y[q] = Real(0);
+    }
+
+    __syncthreads();
+
+    const int exN = g.nx - 1;
+    const int eyN = g.ny - 1;
+    const int ezN = g.nz - 1;
+    const int nElem = exN * eyN * ezN;
+
+    const int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= nElem) return;
+
+    const int ex = e % exN;
+    const int tmp = e / exN;
+    const int ey = tmp % eyN;
+    const int ez = tmp / eyN;
+
+    const int pPin = 0;
+
+    for (int a = 0; a < 8; ++a) {
+        const int rowNode = stokes_local_node_id(g, ex, ey, ez, a);
+        const int ai = rowNode % g.nx;
+        const int atmp = rowNode / g.nx;
+        const int aj = atmp % g.ny;
+        const int ak = atmp / g.ny;
+
+        const bool rowBoundary = g_boundary(g, ai, aj, ak);
+
+        if (!rowBoundary) {
+            Real yu[3] = {Real(0), Real(0), Real(0)};
+
+            for (int b = 0; b < 8; ++b) {
+                const int colNode = stokes_local_node_id(g, ex, ey, ez, b);
+                const int bi = colNode % g.nx;
+                const int btmp = colNode / g.nx;
+                const int bj = btmp % g.ny;
+                const int bk = btmp / g.ny;
+
+                const bool colBoundary = g_boundary(g, bi, bj, bk);
+                const Real ke = stokes_local_ke_q1<Real>(g, a, b);
+
+                if (!colBoundary) {
+                    yu[0] += nu * ke * x[colNode];
+                    yu[1] += nu * ke * x[nn + colNode];
+                    yu[2] += nu * ke * x[2 * nn + colNode];
+                }
+
+                if (colNode != pPin) {
+                    const Real bx = stokes_local_b_q1<Real>(g, b, a, 0);
+                    const Real by = stokes_local_b_q1<Real>(g, b, a, 1);
+                    const Real bz = stokes_local_b_q1<Real>(g, b, a, 2);
+
+                    const Real pp = x[3 * nn + colNode];
+
+                    // Momentum pressure term: -B^T p.
+                    yu[0] -= bx * pp;
+                    yu[1] -= by * pp;
+                    yu[2] -= bz * pp;
+                }
+            }
+
+            atomicAdd(&y[rowNode], yu[0]);
+            atomicAdd(&y[nn + rowNode], yu[1]);
+            atomicAdd(&y[2 * nn + rowNode], yu[2]);
+        }
+
+        if (rowNode != pPin) {
+            Real yp = Real(0);
+
+            for (int b = 0; b < 8; ++b) {
+                const int colNode = stokes_local_node_id(g, ex, ey, ez, b);
+                const int bi = colNode % g.nx;
+                const int btmp = colNode / g.nx;
+                const int bj = btmp % g.ny;
+                const int bk = btmp / g.ny;
+
+                const bool colBoundary = g_boundary(g, bi, bj, bk);
+
+                if (!colBoundary) {
+                    const Real bx = stokes_local_b_q1<Real>(g, a, b, 0);
+                    const Real by = stokes_local_b_q1<Real>(g, a, b, 1);
+                    const Real bz = stokes_local_b_q1<Real>(g, a, b, 2);
+
+                    yp += bx * x[colNode];
+                    yp += by * x[nn + colNode];
+                    yp += bz * x[2 * nn + colNode];
+                }
+
+                if (colNode != pPin) {
+                    const Real ke = stokes_local_ke_q1<Real>(g, a, b);
+                    yp += tau * ke * x[3 * nn + colNode];
+                }
+            }
+
+            atomicAdd(&y[3 * nn + rowNode], yp);
+        }
+    }
+}
+
+template <class Real>
+__global__ void kernel_apply_stokes_strong_rows(Grid3DCuda g,
+                                                const Real* x,
+                                                Real* y) {
+    const int nn = g.n_nodes_host();
+    const int q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q >= nn) return;
+
+    const int i = q % g.nx;
+    const int tmp = q / g.nx;
+    const int j = tmp % g.ny;
+    const int k = tmp / g.ny;
+
+    if (g_boundary(g, i, j, k)) {
+        y[q] = x[q];
+        y[nn + q] = x[nn + q];
+        y[2 * nn + q] = x[2 * nn + q];
+    }
+
+    if (q == 0) {
+        y[3 * nn + q] = x[3 * nn + q];
+    }
+}
+
+template <class Real>
+__global__ void kernel_assemble_stokes_rhs(Grid3DCuda g,
+                                           Real nu,
+                                           Real tau,
+                                           Real* rhs) {
+    const int nn = g.n_nodes_host();
+    const int total = 4 * nn;
+
+    const int qflat = blockIdx.x * blockDim.x + threadIdx.x;
+    if (qflat < total) rhs[qflat] = Real(0);
+
+    const int exN = g.nx - 1;
+    const int eyN = g.ny - 1;
+    const int ezN = g.nz - 1;
+    const int nElem = exN * eyN * ezN;
+
+    if (qflat >= nElem) return;
+
+    const int ex = qflat % exN;
+    const int tmp = qflat / exN;
+    const int ey = tmp % eyN;
+    const int ez = tmp / eyN;
+
+    const double qp[4] = {
+        -0.86113631159405257522,
+        -0.33998104358485626480,
+         0.33998104358485626480,
+         0.86113631159405257522
+    };
+
+    const double qw[4] = {
+        0.34785484513745385737,
+        0.65214515486254614263,
+        0.65214515486254614263,
+        0.34785484513745385737
+    };
+
+    const double hx = g.hx;
+    const double hy = g.hy;
+    const double hz = g.hz;
+    const double jac = hx * hy * hz / 8.0;
+
+    for (int iq = 0; iq < 4; ++iq) {
+        const double xi = qp[iq];
+        const double wx = qw[iq];
+        const double Nx[2] = {0.5 * (1.0 - xi), 0.5 * (1.0 + xi)};
+        const double dNx[2] = {-1.0 / hx, 1.0 / hx};
+        const double xx = (double(ex) + 0.5 * (1.0 + xi)) * hx;
+
+        for (int jq = 0; jq < 4; ++jq) {
+            const double eta = qp[jq];
+            const double wy = qw[jq];
+            const double Ny[2] = {0.5 * (1.0 - eta), 0.5 * (1.0 + eta)};
+            const double dNy[2] = {-1.0 / hy, 1.0 / hy};
+            const double yy = (double(ey) + 0.5 * (1.0 + eta)) * hy;
+
+            for (int kq = 0; kq < 4; ++kq) {
+                const double zeta = qp[kq];
+                const double wz = qw[kq];
+                const double Nz[2] = {0.5 * (1.0 - zeta), 0.5 * (1.0 + zeta)};
+                const double dNz[2] = {-1.0 / hz, 1.0 / hz};
+                const double zz = (double(ez) + 0.5 * (1.0 + zeta)) * hz;
+
+                double fx, fy, fz;
+                stokes_mms_force(xx, yy, zz, double(nu), fx, fy, fz);
+
+                const double wq = wx * wy * wz * jac;
+
+                for (int a = 0; a < 8; ++a) {
+                    const int ax = a & 1;
+                    const int ay = (a >> 1) & 1;
+                    const int az = (a >> 2) & 1;
+
+                    const int rowNode = stokes_local_node_id(g, ex, ey, ez, a);
+                    const int ri = rowNode % g.nx;
+                    const int rtmp = rowNode / g.nx;
+                    const int rj = rtmp % g.ny;
+                    const int rk = rtmp / g.ny;
+
+                    const bool rb = g_boundary(g, ri, rj, rk);
+
+                    const double Na = Nx[ax] * Ny[ay] * Nz[az];
+                    const double dNadx = dNx[ax] * Ny[ay] * Nz[az];
+                    const double dNady = Nx[ax] * dNy[ay] * Nz[az];
+                    const double dNadz = Nx[ax] * Ny[ay] * dNz[az];
+
+                    if (!rb) {
+                        atomicAdd(&rhs[rowNode], Real(Na * fx * wq));
+                        atomicAdd(&rhs[nn + rowNode], Real(Na * fy * wq));
+                        atomicAdd(&rhs[2 * nn + rowNode], Real(Na * fz * wq));
+                    }
+
+                    if (rowNode != 0) {
+                        const double pspg =
+                            double(tau) * (dNadx * fx + dNady * fy + dNadz * fz) * wq;
+
+                        atomicAdd(&rhs[3 * nn + rowNode], Real(pspg));
+                    }
+                }
+            }
+        }
+    }
+}
+
+template <class Real>
+__global__ void kernel_apply_stokes_rhs_strong_rows(Grid3DCuda g,
+                                                    Real* rhs) {
+    const int nn = g.n_nodes_host();
+    const int q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q >= nn) return;
+
+    const int i = q % g.nx;
+    const int tmp = q / g.nx;
+    const int j = tmp % g.ny;
+    const int k = tmp / g.ny;
+
+    if (g_boundary(g, i, j, k)) {
+        rhs[q] = Real(0);
+        rhs[nn + q] = Real(0);
+        rhs[2 * nn + q] = Real(0);
+    }
+
+    if (q == 0) {
+        // p_exact(0,0,0)=0.
+        rhs[3 * nn + q] = Real(0);
+    }
+}
+
+template <class Real>
+__global__ void kernel_stokes_diag_prec(Grid3DCuda g,
+                                        Real nu,
+                                        Real tau,
+                                        const Real* r,
+                                        Real* z) {
+    const int nn = g.n_nodes_host();
+    const int q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q >= nn) return;
+
+    const int i = q % g.nx;
+    const int tmp = q / g.nx;
+    const int j = tmp % g.ny;
+    const int k = tmp / g.ny;
+
+    const bool bnd = g_boundary(g, i, j, k);
+
+    Real kdiag = Real(0);
+
+    const int ex0 = max(0, i - 1);
+    const int ex1 = min(g.nx - 2, i);
+    const int ey0 = max(0, j - 1);
+    const int ey1 = min(g.ny - 2, j);
+    const int ez0 = max(0, k - 1);
+    const int ez1 = min(g.nz - 2, k);
+
+    for (int ez = ez0; ez <= ez1; ++ez) {
+        for (int ey = ey0; ey <= ey1; ++ey) {
+            for (int ex = ex0; ex <= ex1; ++ex) {
+                const int lx = i - ex;
+                const int ly = j - ey;
+                const int lz = k - ez;
+                const int a = lx + 2 * ly + 4 * lz;
+
+                kdiag += stokes_local_ke_q1<Real>(g, a, a);
+            }
+        }
+    }
+
+    if (bnd) {
+        z[q] = r[q];
+        z[nn + q] = r[nn + q];
+        z[2 * nn + q] = r[2 * nn + q];
+    } else {
+        const Real d = max(nu * kdiag, Real(1e-30));
+        z[q] = r[q] / d;
+        z[nn + q] = r[nn + q] / d;
+        z[2 * nn + q] = r[2 * nn + q] / d;
+    }
+
+    if (q == 0) {
+        z[3 * nn + q] = r[3 * nn + q];
+    } else {
+        const Real d = max(tau * kdiag, Real(1e-30));
+        z[3 * nn + q] = r[3 * nn + q] / d;
+    }
+}
+
+template <class Real>
+class StructuredStokesPspgOperator {
+public:
+    StructuredStokesPspgOperator(
+        const memoirs::structured::StructuredGrid3D& grid,
+        Real nu,
+        Real tauScale
+    )
+        : grid_(grid),
+          dg_(to_cuda_grid(grid)),
+          nu_(nu) {
+        const Real h = Real(grid.hx());
+        tau_ = tauScale * h * h / nu_;
+    }
+
+    int size() const { return 4 * grid_.n_nodes(); }
+    int scalar_size() const { return grid_.n_nodes(); }
+    Real tau() const { return tau_; }
+
+    const memoirs::structured::StructuredGrid3D& grid() const {
+        return grid_;
+    }
+
+    void apply(const Real* x, Real* y) const {
+        const int nn = grid_.n_nodes();
+        const int nElem =
+            (grid_.nx - 1) * (grid_.ny - 1) * (grid_.nz - 1);
+
+        const int block = 256;
+        const int gridBlocks = div_up(std::max(4 * nn, nElem), block);
+
+        kernel_apply_stokes_pspg<Real>
+            <<<gridBlocks, block>>>
+            (dg_, nu_, tau_, x, y);
+        MEMOIRS_CUDA_KERNEL_CHECK();
+
+        kernel_apply_stokes_strong_rows<Real>
+            <<<div_up(nn, block), block>>>
+            (dg_, x, y);
+        MEMOIRS_CUDA_KERNEL_CHECK();
+    }
+
+    void assemble_rhs(Real* rhs) const {
+        const int nn = grid_.n_nodes();
+        const int nElem =
+            (grid_.nx - 1) * (grid_.ny - 1) * (grid_.nz - 1);
+
+        const int block = 256;
+        const int gridBlocks = div_up(std::max(4 * nn, nElem), block);
+
+        kernel_assemble_stokes_rhs<Real>
+            <<<gridBlocks, block>>>
+            (dg_, nu_, tau_, rhs);
+        MEMOIRS_CUDA_KERNEL_CHECK();
+
+        kernel_apply_stokes_rhs_strong_rows<Real>
+            <<<div_up(nn, block), block>>>
+            (dg_, rhs);
+        MEMOIRS_CUDA_KERNEL_CHECK();
+    }
+
+private:
+    memoirs::structured::StructuredGrid3D grid_;
+    Grid3DCuda dg_;
+    Real nu_;
+    Real tau_;
+};
+
+template <class Real>
+class StructuredStokesDiagonalPreconditioner {
+public:
+    StructuredStokesDiagonalPreconditioner(
+        const memoirs::structured::StructuredGrid3D& grid,
+        Real nu,
+        Real tau
+    )
+        : grid_(grid),
+          dg_(to_cuda_grid(grid)),
+          nu_(nu),
+          tau_(tau) {}
+
+    void apply(const Real* r, Real* z) {
+        const int n = grid_.n_nodes();
+        const int block = 256;
+
+        kernel_stokes_diag_prec<Real>
+            <<<div_up(n, block), block>>>
+            (dg_, nu_, tau_, r, z);
+        MEMOIRS_CUDA_KERNEL_CHECK();
+    }
+
+private:
+    memoirs::structured::StructuredGrid3D grid_;
+    Grid3DCuda dg_;
+    Real nu_;
+    Real tau_;
+};
+
+} // namespace gpu
+} // namespace memoirs
+
+int main(int argc, char** argv) {
+    GpuMemoryMonitor gpuMemMon;
+
+    try {
+        const Cli cli = parse_cli(argc, argv);
+        gpuMemMon.start();
+
+        using Grid = memoirs::structured::StructuredGrid3D;
+        using Op = memoirs::gpu::StructuredStokesPspgOperator<Real>;
+        using Prec = memoirs::gpu::StructuredStokesDiagonalPreconditioner<Real>;
+
+        const Grid grid(cli.nElem + 1, cli.nElem + 1, cli.nElem + 1);
+
+        Op A(grid, Real(cli.nu), Real(cli.tauScale));
+        Prec M(grid, Real(cli.nu), A.tau());
+
+        const int total = A.size();
+
+        memoirs::gpu::DeviceBuffer<Real> d_b(static_cast<std::size_t>(total));
+        memoirs::gpu::DeviceBuffer<Real> d_x(static_cast<std::size_t>(total));
+
+        A.assemble_rhs(d_b.data());
+
+        std::cout << "Memoirs CUDA structured Q1/Q1 Stokes PSPG MMS test\n";
+        std::cout << "precision                 = " << kPrecisionName << "\n";
+        std::cout << "grid                      = " << grid.label() << "\n";
+        std::cout << "unknowns                  = " << total << "\n";
+        std::cout << "operator                  = monolithic_stokes_pspg_matrix_free\n";
+        std::cout << "mms                       = divergence_free_sine_velocity_sine_pressure\n";
+        std::cout << "velocityBC                = homogeneous_dirichlet_all_faces\n";
+        std::cout << "pressurePin               = node_0_exact_value_0\n";
+        std::cout << "solver                    = right_bicgstab\n";
+        std::cout << "rightPreconditioner       = monolithic_inverse_diagonal\n";
+        std::cout << "nu                        = " << cli.nu << "\n";
+        std::cout << "tauScale                  = " << cli.tauScale << "\n";
+        std::cout << "tau                       = " << double(A.tau()) << "\n";
+        std::cout << "tol                       = " << cli.tol << "\n";
+        std::cout << "maxit                     = " << cli.maxit << "\n";
+
+        memoirs::diagnostics::CudaGmgTimingReport timingReport;
+        memoirs::diagnostics::CudaSynchronizedTimer timer;
+
+        memoirs::gpu::CudaRightBicgstabReport<Real> rep;
+
+        for (int r = 0; r < cli.repeats; ++r) {
+            d_x.zero();
+
+            timer.start();
+            rep = memoirs::gpu::bicgstab_right_prec_cuda<Real>(
+                A, M, d_b.data(), d_x.data(),
+                Real(cli.tol), cli.maxit, cli.printEvery);
+            timingReport.solveTotalSeconds += timer.stop_seconds();
+            timingReport.solveRepeats += 1;
+
+            std::vector<Real> h_x(static_cast<std::size_t>(total));
+            d_x.copy_to_host(h_x.data(), h_x.size());
+
+            const auto err =
+                memoirs::diagnostics::structured_q1_l2_error_stokes_mms<Real>(
+                    grid, h_x);
+
+            std::cout << "--------------- stokes pspg solve report ---------------\n";
+            std::cout << "repeat                    = " << r << "\n";
+            std::cout << "iterations                = " << rep.iterations << "\n";
+            std::cout << "converged                 = " << rep.converged << "\n";
+            std::cout << "breakdown                 = " << rep.breakdown << "\n";
+            std::cout << std::setprecision(17);
+            std::cout << "initialResidual           = " << rep.initialResidual << "\n";
+            std::cout << "finalResidual             = " << rep.finalResidual << "\n";
+            std::cout << "finalRelativeResidual     = " << rep.finalRelativeResidual << "\n";
+            std::cout << "velocityL2Quadrature      = " << err.velocityL2 << "\n";
+            std::cout << "pressureL2Quadrature      = " << err.pressureL2 << "\n";
+            std::cout << "--------------------------------------------------------\n";
+
+            if (!rep.converged || rep.breakdown) {
+                gpuMemMon.stop();
+                gpuMemMon.print(std::cout);
+                return 2;
+            }
+        }
+
+        if (timingReport.solveRepeats > 0) {
+            timingReport.solveAvgSeconds =
+                timingReport.solveTotalSeconds / double(timingReport.solveRepeats);
+        }
+
+        timingReport.print(std::cout);
+
+        gpuMemMon.stop();
+        gpuMemMon.print(std::cout);
+
+        return 0;
+    } catch (const std::exception& e) {
+        gpuMemMon.stop();
+        gpuMemMon.print(std::cout);
+        std::cerr << "FATAL: " << e.what() << "\n";
+        return 1;
+    }
+}

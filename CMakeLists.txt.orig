@@ -1,0 +1,458 @@
+cmake_minimum_required(VERSION 3.20)
+project(memoirs_v0_modular LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
+set(MEMOIRS_PRECISION "double" CACHE STRING "single or double")
+set_property(CACHE MEMOIRS_PRECISION PROPERTY STRINGS single double)
+
+option(MEMOIRS_USE_HYPRE "Enable HYPRE IJ/ParCSR solve path" OFF)
+set(HYPRE_ROOT "" CACHE PATH "Root of HYPRE install")
+
+add_executable(memoirs_poisson_mms apps/poisson_mms.cpp)
+add_executable(memoirs_q1_poisson_oneshot ALIAS memoirs_poisson_mms)
+set_target_properties(memoirs_poisson_mms PROPERTIES OUTPUT_NAME memoirs_q1_poisson_oneshot)
+
+target_include_directories(memoirs_poisson_mms PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+target_compile_definitions(memoirs_poisson_mms PRIVATE
+  MEMOIRS_PRECISION_${MEMOIRS_PRECISION}
+)
+
+target_compile_options(memoirs_poisson_mms PRIVATE
+  -Wall -Wextra
+)
+
+
+# Experimental Q1/Q1 NSE HYPRE-IJ branch. Patch 1 is a scalar-Poisson smoke
+# test of the copied ParCSR GMRES/FlexGMRES path; the old Poisson target stays intact.
+add_executable(memoirs_test_structured_q1q1_nse_mms_hypre_ij
+  apps/test_structured_q1q1_nse_mms_hypre_ij.cpp
+)
+target_include_directories(memoirs_test_structured_q1q1_nse_mms_hypre_ij PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_compile_definitions(memoirs_test_structured_q1q1_nse_mms_hypre_ij PRIVATE
+  MEMOIRS_PRECISION_${MEMOIRS_PRECISION}
+)
+target_compile_options(memoirs_test_structured_q1q1_nse_mms_hypre_ij PRIVATE
+  -Wall -Wextra
+)
+
+# Experimental Q2/Q1 NSE HYPRE-IJ branch.
+# Phase 0 scaffold: structured Q2 velocity / Q1 pressure accounting and
+# cavity boundary masks only. This deliberately follows the Q1/Q1 HYPRE-IJ
+# branch architecture and does not import the old scratch Q2/Q1 custom solver.
+add_executable(memoirs_test_structured_q2q1_nse_mms_hypre_ij EXCLUDE_FROM_ALL
+  apps/test_structured_q2q1_nse_mms_hypre_ij.cpp
+)
+target_include_directories(memoirs_test_structured_q2q1_nse_mms_hypre_ij PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_compile_definitions(memoirs_test_structured_q2q1_nse_mms_hypre_ij PRIVATE
+  MEMOIRS_PRECISION_${MEMOIRS_PRECISION}
+)
+target_compile_options(memoirs_test_structured_q2q1_nse_mms_hypre_ij PRIVATE
+  -Wall -Wextra
+)
+
+
+# Standalone modular solver tests. These do not depend on HYPRE and do not
+# modify the existing Poisson/HYPRE executable path.
+add_executable(memoirs_test_dense_lu apps/test_dense_lu.cpp)
+
+target_include_directories(memoirs_test_dense_lu PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+target_compile_definitions(memoirs_test_dense_lu PRIVATE
+  MEMOIRS_PRECISION_${MEMOIRS_PRECISION}
+)
+
+target_compile_options(memoirs_test_dense_lu PRIVATE
+  -Wall -Wextra
+)
+
+find_package(Threads REQUIRED)
+
+target_link_libraries(memoirs_poisson_mms PRIVATE
+  Threads::Threads
+  dl
+)
+
+if(MEMOIRS_USE_HYPRE)
+  if(NOT HYPRE_ROOT)
+    message(FATAL_ERROR "MEMOIRS_USE_HYPRE=ON requires -DHYPRE_ROOT=/path/to/hypre")
+  endif()
+
+  find_package(MPI REQUIRED)
+
+  find_path(HYPRE_INCLUDE_DIR
+    NAMES HYPRE.h
+    PATHS
+      ${HYPRE_ROOT}/include
+      ${HYPRE_ROOT}
+    NO_DEFAULT_PATH
+  )
+
+  find_library(HYPRE_LIBRARY
+    NAMES HYPRE hypre
+    PATHS
+      ${HYPRE_ROOT}/lib
+      ${HYPRE_ROOT}/lib64
+      ${HYPRE_ROOT}
+    NO_DEFAULT_PATH
+  )
+
+  if(NOT HYPRE_INCLUDE_DIR)
+    message(FATAL_ERROR "Could not find HYPRE.h under HYPRE_ROOT=${HYPRE_ROOT}")
+  endif()
+
+  if(NOT HYPRE_LIBRARY)
+    message(FATAL_ERROR "Could not find libHYPRE under HYPRE_ROOT=${HYPRE_ROOT}")
+  endif()
+
+  target_compile_definitions(memoirs_poisson_mms PRIVATE
+    MEMOIRS_USE_HYPRE=1
+  )
+
+  target_include_directories(memoirs_poisson_mms PRIVATE
+    ${HYPRE_INCLUDE_DIR}
+  )
+
+  target_link_libraries(memoirs_poisson_mms PRIVATE
+    MPI::MPI_CXX
+    ${HYPRE_LIBRARY}
+    m
+    dl
+  )
+
+
+  target_compile_definitions(memoirs_test_structured_q1q1_nse_mms_hypre_ij PRIVATE
+    MEMOIRS_USE_HYPRE=1
+  )
+  target_include_directories(memoirs_test_structured_q1q1_nse_mms_hypre_ij PRIVATE
+    ${HYPRE_INCLUDE_DIR}
+  )
+  target_link_libraries(memoirs_test_structured_q1q1_nse_mms_hypre_ij PRIVATE
+    MPI::MPI_CXX
+    ${HYPRE_LIBRARY}
+    m
+    dl
+  )
+
+  target_compile_definitions(memoirs_test_structured_q2q1_nse_mms_hypre_ij PRIVATE
+    MEMOIRS_USE_HYPRE=1
+  )
+  target_include_directories(memoirs_test_structured_q2q1_nse_mms_hypre_ij PRIVATE
+    ${HYPRE_INCLUDE_DIR}
+  )
+  target_link_libraries(memoirs_test_structured_q2q1_nse_mms_hypre_ij PRIVATE
+    MPI::MPI_CXX
+    ${HYPRE_LIBRARY}
+    m
+    dl
+  )
+
+  find_package(CUDAToolkit QUIET)
+  if(CUDAToolkit_FOUND)
+    target_link_libraries(memoirs_poisson_mms PRIVATE
+      CUDA::cudart
+      CUDA::cusparse
+      CUDA::cublas
+      CUDA::curand
+    )
+    target_link_libraries(memoirs_test_structured_q1q1_nse_mms_hypre_ij PRIVATE
+      CUDA::cudart
+      CUDA::cusparse
+      CUDA::cublas
+      CUDA::curand
+    )
+    target_link_libraries(memoirs_test_structured_q2q1_nse_mms_hypre_ij PRIVATE
+      CUDA::cudart
+      CUDA::cusparse
+      CUDA::cublas
+      CUDA::curand
+    )
+    message(STATUS "CUDAToolkit found; linked CUDA runtime/libs for CUDA-enabled HYPRE.")
+  endif()
+
+  message(STATUS "HYPRE include = ${HYPRE_INCLUDE_DIR}")
+  message(STATUS "HYPRE library = ${HYPRE_LIBRARY}")
+endif()
+
+message(STATUS "Memoirs modular precision = ${MEMOIRS_PRECISION}")
+message(STATUS "Memoirs use HYPRE          = ${MEMOIRS_USE_HYPRE}")
+
+
+# Standalone structured matrix-free PCG+GMG test.
+# This does not modify the existing Poisson/HYPRE app.
+add_executable(memoirs_test_structured_gmg apps/test_structured_gmg.cpp)
+
+target_include_directories(memoirs_test_structured_gmg PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+target_compile_definitions(memoirs_test_structured_gmg PRIVATE
+  MEMOIRS_PRECISION_${MEMOIRS_PRECISION}
+)
+
+target_compile_options(memoirs_test_structured_gmg PRIVATE
+  -Wall -Wextra
+)
+
+
+enable_language(CUDA)
+find_package(CUDAToolkit REQUIRED)
+
+
+# Standalone CUDA structured matrix-free PCG+GMG test.
+# This is separate from the existing HYPRE Poisson executable.
+add_executable(memoirs_test_structured_gmg_cuda
+  apps/test_structured_gmg_cuda.cu
+)
+
+target_include_directories(memoirs_test_structured_gmg_cuda PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+target_compile_definitions(memoirs_test_structured_gmg_cuda PRIVATE
+  MEMOIRS_PRECISION_${MEMOIRS_PRECISION}
+)
+
+set_target_properties(memoirs_test_structured_gmg_cuda PROPERTIES
+  CUDA_STANDARD 17
+  CUDA_STANDARD_REQUIRED ON
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED ON
+)
+
+target_link_libraries(memoirs_test_structured_gmg_cuda PRIVATE
+  CUDA::cudart
+  CUDA::cublas
+  Threads::Threads
+  dl
+)
+
+
+# Experimental structured CUDA Q1 scalar transport MMS app.
+# Separate from the generic HYPRE/unstructured path.
+add_executable(memoirs_test_structured_q1_transport_mms_cuda
+  apps/test_structured_q1_transport_mms_cuda.cu
+)
+
+target_include_directories(memoirs_test_structured_q1_transport_mms_cuda PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+target_compile_definitions(memoirs_test_structured_q1_transport_mms_cuda PRIVATE
+  MEMOIRS_PRECISION_${MEMOIRS_PRECISION}
+)
+
+set_target_properties(memoirs_test_structured_q1_transport_mms_cuda PROPERTIES
+  CUDA_STANDARD 17
+  CUDA_STANDARD_REQUIRED ON
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED ON
+)
+
+target_link_libraries(memoirs_test_structured_q1_transport_mms_cuda PRIVATE
+  CUDA::cudart
+  CUDA::cublas
+  Threads::Threads
+  dl
+)
+
+
+# Experimental structured CUDA Q1 Poisson Neumann MMS app.
+# Separate from the generic HYPRE/unstructured path.
+add_executable(memoirs_test_structured_q1_poisson_neumann_mms_cuda
+  apps/test_structured_q1_poisson_neumann_mms_cuda.cu
+)
+
+target_include_directories(memoirs_test_structured_q1_poisson_neumann_mms_cuda PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+target_compile_definitions(memoirs_test_structured_q1_poisson_neumann_mms_cuda PRIVATE
+  MEMOIRS_PRECISION_${MEMOIRS_PRECISION}
+)
+
+set_target_properties(memoirs_test_structured_q1_poisson_neumann_mms_cuda PROPERTIES
+  CUDA_STANDARD 17
+  CUDA_STANDARD_REQUIRED ON
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED ON
+)
+
+target_link_libraries(memoirs_test_structured_q1_poisson_neumann_mms_cuda PRIVATE
+  CUDA::cudart
+  CUDA::cublas
+  Threads::Threads
+  dl
+)
+
+
+# Experimental structured CUDA Q1/Q1 Stokes PSPG MMS app.
+# Separate from the generic HYPRE/unstructured path and from the validated
+# scalar structured Poisson/transport targets.
+add_executable(memoirs_test_structured_q1_stokes_pspg_mms_cuda
+  apps/test_structured_q1_stokes_pspg_mms_cuda.cu
+)
+
+target_include_directories(memoirs_test_structured_q1_stokes_pspg_mms_cuda PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+target_compile_definitions(memoirs_test_structured_q1_stokes_pspg_mms_cuda PRIVATE
+  MEMOIRS_PRECISION_${MEMOIRS_PRECISION}
+)
+
+set_target_properties(memoirs_test_structured_q1_stokes_pspg_mms_cuda PROPERTIES
+  CUDA_STANDARD 17
+  CUDA_STANDARD_REQUIRED ON
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED ON
+)
+
+target_link_libraries(memoirs_test_structured_q1_stokes_pspg_mms_cuda PRIVATE
+  CUDA::cudart
+  CUDA::cublas
+  Threads::Threads
+  dl
+)
+# Separate from the generic HYPRE/unstructured path.
+
+
+# Experimental structured CUDA Q2/Q1 Stokes PSPG MMS app.
+# Forked from the verified Q1/Q1 Stokes PSPG MMS app.
+# This target is intentionally separate while the mixed-order operator is developed.
+add_executable(memoirs_test_structured_q2q1_stokes_pspg_mms_cuda EXCLUDE_FROM_ALL
+  apps/test_structured_q2q1_stokes_pspg_mms_cuda.cu
+)
+
+target_include_directories(memoirs_test_structured_q2q1_stokes_pspg_mms_cuda PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+target_compile_definitions(memoirs_test_structured_q2q1_stokes_pspg_mms_cuda PRIVATE
+  MEMOIRS_PRECISION_${MEMOIRS_PRECISION}
+)
+
+set_target_properties(memoirs_test_structured_q2q1_stokes_pspg_mms_cuda PROPERTIES
+  CUDA_STANDARD 17
+  CUDA_STANDARD_REQUIRED ON
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED ON
+)
+
+target_link_libraries(memoirs_test_structured_q2q1_stokes_pspg_mms_cuda PRIVATE
+  CUDA::cudart
+  CUDA::cublas
+  Threads::Threads
+  dl
+)
+
+
+# Experimental structured CUDA Q2/Q1 Navier-Stokes Picard PSPG MMS app.
+# Forked from the verified Q2/Q1 Stokes PSPG MMS app; do not use this to replace the Stokes baseline.
+add_executable(memoirs_test_structured_q2q1_navier_stokes_picard_mms_cuda EXCLUDE_FROM_ALL
+  apps/test_structured_q2q1_navier_stokes_picard_mms_cuda.cu
+)
+
+target_include_directories(memoirs_test_structured_q2q1_navier_stokes_picard_mms_cuda PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+target_compile_definitions(memoirs_test_structured_q2q1_navier_stokes_picard_mms_cuda PRIVATE
+  MEMOIRS_PRECISION_${MEMOIRS_PRECISION}
+)
+
+set_target_properties(memoirs_test_structured_q2q1_navier_stokes_picard_mms_cuda PROPERTIES
+  CUDA_STANDARD 17
+  CUDA_STANDARD_REQUIRED ON
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED ON
+)
+
+target_link_libraries(memoirs_test_structured_q2q1_navier_stokes_picard_mms_cuda PRIVATE
+  CUDA::cudart
+  CUDA::cublas
+  Threads::Threads
+  dl
+)
+
+
+# Experimental structured CUDA Q1/Q1 Navier-Stokes Picard PSPG/SUPG MMS app.
+# First fast-path fork toward a Poisson-style structured Q1/Q1 monolithic solver.
+add_executable(memoirs_test_structured_q1q1_navier_stokes_picard_mms_cuda
+  apps/test_structured_q1q1_navier_stokes_picard_mms_cuda.cu
+)
+
+target_include_directories(memoirs_test_structured_q1q1_navier_stokes_picard_mms_cuda PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+target_compile_definitions(memoirs_test_structured_q1q1_navier_stokes_picard_mms_cuda PRIVATE
+  MEMOIRS_PRECISION_${MEMOIRS_PRECISION}
+)
+
+set_target_properties(memoirs_test_structured_q1q1_navier_stokes_picard_mms_cuda PROPERTIES
+  CUDA_STANDARD 17
+  CUDA_STANDARD_REQUIRED ON
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED ON
+)
+
+target_link_libraries(memoirs_test_structured_q1q1_navier_stokes_picard_mms_cuda PRIVATE
+  CUDA::cudart
+  CUDA::cublas
+  Threads::Threads
+  dl
+)
+
+
+# Optional CUDA audit source for the Q1/Q1 HYPRE-IJ Picard assembler.
+# The app still solves through HYPRE; this source only assembles values/RHS on CUDA
+# for host-vs-device comparison when MEMOIRS_Q1Q1_CUDA_AUDIT_ASSEMBLY=1.
+if(TARGET memoirs_test_structured_q1q1_nse_mms_hypre_ij)
+  target_sources(memoirs_test_structured_q1q1_nse_mms_hypre_ij PRIVATE
+    apps/q1q1_nse_cuda_audit.cu
+  )
+  set_source_files_properties(apps/q1q1_nse_cuda_audit.cu PROPERTIES LANGUAGE CUDA)
+  set_target_properties(memoirs_test_structured_q1q1_nse_mms_hypre_ij PROPERTIES
+    CUDA_ARCHITECTURES 86
+    CUDA_STANDARD 17
+    CUDA_STANDARD_REQUIRED ON
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    CUDA_SEPARABLE_COMPILATION OFF
+  )
+endif()
+
+
+# Optional CUDA audit source for the Q2/Q1 HYPRE-IJ refactor scaffold.
+# This only verifies CUDA can fill fixed-pattern values/RHS before HYPRE IJ use.
+if(TARGET memoirs_test_structured_q2q1_nse_mms_hypre_ij)
+  target_sources(memoirs_test_structured_q2q1_nse_mms_hypre_ij PRIVATE
+    apps/q2q1_nse_cuda_audit.cu
+  )
+  set_source_files_properties(apps/q2q1_nse_cuda_audit.cu PROPERTIES LANGUAGE CUDA)
+  set_target_properties(memoirs_test_structured_q2q1_nse_mms_hypre_ij PROPERTIES
+    CUDA_ARCHITECTURES 86
+    CUDA_STANDARD 17
+    CUDA_STANDARD_REQUIRED ON
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    CUDA_SEPARABLE_COMPILATION OFF
+  )
+endif()
+
+

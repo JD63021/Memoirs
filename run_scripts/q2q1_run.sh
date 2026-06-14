@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+set -u
+
+cd /home/jd/memoirs_v0_modular_patch014
+
+N="${N:-16}"
+PROBLEM="${PROBLEM:-mms}"
+HYPRE_MEMORY="${HYPRE_MEMORY:-device}"
+SOLVER="${SOLVER:-bicgstab}"
+LIN_TOL="${LIN_TOL:-1e-8}"
+LIN_MAXIT="${LIN_MAXIT:-2000}"
+Q2Q1_BUILD_PATTERN="${Q2Q1_BUILD_PATTERN:-0}"
+Q2Q1_BUILD_SLOT_CACHE="${Q2Q1_BUILD_SLOT_CACHE:-0}"
+Q2Q1_HYPRE_SMOKE="${Q2Q1_HYPRE_SMOKE:-0}"
+Q2Q1_CUDA_IDENTITY_FILL="${Q2Q1_CUDA_IDENTITY_FILL:-0}"
+Q2Q1_BASIS_AUDIT="${Q2Q1_BASIS_AUDIT:-0}"
+Q2Q1_ASSEMBLE_STOKES_MMS="${Q2Q1_ASSEMBLE_STOKES_MMS:-0}"
+Q2Q1_STOKES_SOLVE="${Q2Q1_STOKES_SOLVE:-0}"
+Q2Q1_STOKES_RHS_MODE="${Q2Q1_STOKES_RHS_MODE:-algebraic}"
+Q2Q1_STOKES_CUDA_ASSEMBLY="${Q2Q1_STOKES_CUDA_ASSEMBLY:-0}"
+NU="${NU:-1.0}"
+COMPUTE_ERROR="${COMPUTE_ERROR:-1}"
+
+mkdir -p logs
+STAMP=$(date +%Y%m%d_%H%M%S)
+LOG="logs/q2q1_scaffold_N${N}_${STAMP}.log"
+LATEST="logs/q2q1_latest.log"
+
+cat <<EOT
+============================================================
+Q2/Q1 NSE IJ/ParCSR SCAFFOLD RUN
+============================================================
+N            = $N
+PROBLEM      = $PROBLEM
+HYPRE_MEMORY = $HYPRE_MEMORY
+SOLVER       = $SOLVER
+LIN_TOL      = $LIN_TOL
+LIN_MAXIT    = $LIN_MAXIT
+BUILD_PATTERN = $Q2Q1_BUILD_PATTERN
+BUILD_SLOT_CACHE = $Q2Q1_BUILD_SLOT_CACHE
+HYPRE_SMOKE = $Q2Q1_HYPRE_SMOKE
+CUDA_IDENTITY_FILL = $Q2Q1_CUDA_IDENTITY_FILL
+BASIS_AUDIT = $Q2Q1_BASIS_AUDIT
+ASSEMBLE_STOKES_MMS = $Q2Q1_ASSEMBLE_STOKES_MMS
+STOKES_SOLVE = $Q2Q1_STOKES_SOLVE
+STOKES_RHS_MODE = $Q2Q1_STOKES_RHS_MODE
+STOKES_CUDA_ASSEMBLY = $Q2Q1_STOKES_CUDA_ASSEMBLY
+NU = $NU
+COMPUTE_ERROR = $COMPUTE_ERROR
+LOG          = $LOG
+============================================================
+EOT
+
+stdbuf -oL -eL env \
+  MEMOIRS_Q2Q1_PROBLEM="$PROBLEM" \
+  MEMOIRS_Q2Q1_BUILD_PATTERN="$Q2Q1_BUILD_PATTERN" \
+  MEMOIRS_Q2Q1_BUILD_SLOT_CACHE="$Q2Q1_BUILD_SLOT_CACHE" \
+  MEMOIRS_Q2Q1_HYPRE_SMOKE="$Q2Q1_HYPRE_SMOKE" \
+  MEMOIRS_Q2Q1_CUDA_IDENTITY_FILL="$Q2Q1_CUDA_IDENTITY_FILL" \
+  MEMOIRS_Q2Q1_BASIS_AUDIT="$Q2Q1_BASIS_AUDIT" \
+  MEMOIRS_Q2Q1_ASSEMBLE_STOKES_MMS="$Q2Q1_ASSEMBLE_STOKES_MMS" \
+  MEMOIRS_Q2Q1_STOKES_SOLVE="$Q2Q1_STOKES_SOLVE" \
+  MEMOIRS_Q2Q1_STOKES_RHS_MODE="$Q2Q1_STOKES_RHS_MODE" \
+  MEMOIRS_Q2Q1_STOKES_CUDA_ASSEMBLY="$Q2Q1_STOKES_CUDA_ASSEMBLY" \
+  MEMOIRS_Q2Q1_NU="$NU" \
+  MEMOIRS_COMPUTE_ERROR="$COMPUTE_ERROR" \
+  MEMOIRS_Q1Q1_CACHE_IJ_PATTERN=1 \
+  MEMOIRS_Q1Q1_DIRECT_IJ_VALUES=1 \
+  MEMOIRS_AMG_NUM_FUNCTIONS=4 \
+  MEMOIRS_AMG_NODAL=0 \
+  MEMOIRS_AMG_NODAL_LEVELS=0 \
+  MEMOIRS_AMG_COARSEN=8 \
+  MEMOIRS_AMG_INTERP=15 \
+  MEMOIRS_AMG_RELAX=18 \
+  MEMOIRS_AMG_AGG_LEVELS=0 \
+  MEMOIRS_AMG_KEEP_TRANSPOSE=1 \
+  MEMOIRS_AMG_PMAX=4 \
+  MEMOIRS_AMG_TRUNC=0.2 \
+  MEMOIRS_AMG_STRONG=-1 \
+  ./build_dp_hypre_q1q1/memoirs_test_structured_q2q1_nse_mms_hypre_ij \
+    -polyMeshDir /home/jd/Desktop/meshes/unitcube/blockmesh/${N}cube/constant/polyMesh \
+    -space cg_hex_q1 \
+    -mms sin \
+    -solver "$SOLVER" \
+    -precond boomeramg \
+    -hypreMemory "$HYPRE_MEMORY" \
+    -tol "$LIN_TOL" \
+    -maxit "$LIN_MAXIT" \
+    -diagLevel 0 \
+  2>&1 | tee "$LOG"
+
+STATUS=${PIPESTATUS[0]}
+cp "$LOG" "$LATEST"
+
+echo
+echo "============================================================"
+echo "Q2/Q1 SCAFFOLD RUN FINISHED"
+echo "exit status = $STATUS"
+echo "full log    = $LOG"
+echo "latest log  = $LATEST"
+echo "============================================================"
+
+tail -60 "$LOG"
+exit "$STATUS"

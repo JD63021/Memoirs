@@ -1,0 +1,320 @@
+#pragma once
+
+// Auto-split from frozen patch014 one-shot source.
+// This header is intentionally included in order by apps/poisson_mms.cpp.
+
+// ============================================================================
+// SECTION 8: Assembly and Dirichlet elimination
+// ============================================================================
+
+struct AssembledSystem {
+    SparseRows A;
+    std::vector<Real> b;
+    int nDirichlet = 0;
+};
+
+static void assemble_hex_q1_cell(
+    const PolyMesh& m,
+    const Cell& c,
+    const std::string& mms,
+    SparseRows& A,
+    std::vector<Real>& b
+) {
+    const auto hv = ordered_hex_vertices_axis_aligned(m, c);
+
+    const double q = 1.0 / std::sqrt(3.0);
+    const double qp[2] = {-q, q};
+
+    Real Ke[8][8] = {};
+    Real Fe[8] = {};
+
+    for (int ix = 0; ix < 2; ++ix) {
+        for (int iy = 0; iy < 2; ++iy) {
+            for (int iz = 0; iz < 2; ++iz) {
+                const double xi = qp[ix];
+                const double eta = qp[iy];
+                const double zeta = qp[iz];
+
+                std::array<double,8> N;
+                std::array<Vec3,8> dNref;
+                hex_q1_basis(xi, eta, zeta, N, dNref);
+
+                Vec3 xq;
+                Mat3 J;
+
+                for (int a = 0; a < 8; ++a) {
+                    const Vec3& X = m.points[hv[a]];
+                    xq.x += N[a] * X.x;
+                    xq.y += N[a] * X.y;
+                    xq.z += N[a] * X.z;
+
+                    J.a[0][0] += dNref[a].x * X.x;
+                    J.a[1][0] += dNref[a].x * X.y;
+                    J.a[2][0] += dNref[a].x * X.z;
+
+                    J.a[0][1] += dNref[a].y * X.x;
+                    J.a[1][1] += dNref[a].y * X.y;
+                    J.a[2][1] += dNref[a].y * X.z;
+
+                    J.a[0][2] += dNref[a].z * X.x;
+                    J.a[1][2] += dNref[a].z * X.y;
+                    J.a[2][2] += dNref[a].z * X.z;
+                }
+
+                const double detJ = det3(J);
+                const double wdet = std::abs(detJ);
+                const Mat3 invJ = inv3(J);
+
+                std::array<Vec3,8> grad;
+                for (int a = 0; a < 8; ++a) {
+                    grad[a] = invJT_mul(invJ, dNref[a]);
+                }
+
+                const double f = mms_rhs_value(xq, mms);
+
+                for (int a = 0; a < 8; ++a) {
+                    Fe[a] += Real(N[a] * f * wdet);
+                    for (int bb = 0; bb < 8; ++bb) {
+                        Ke[a][bb] += Real(dot3(grad[a], grad[bb]) * wdet);
+                    }
+                }
+            }
+        }
+    }
+
+    for (int a = 0; a < 8; ++a) {
+        int I = hv[a];
+        b[I] += Fe[a];
+        for (int bb = 0; bb < 8; ++bb) {
+            int J = hv[bb];
+            sparse_add(A, I, J, Ke[a][bb]);
+        }
+    }
+}
+
+static void assemble_tet_p1_cell(
+    const PolyMesh& m,
+    const Cell& c,
+    const std::string& mms,
+    SparseRows& A,
+    std::vector<Real>& b
+) {
+    if (c.verts.size() != 4) throw std::runtime_error("Tet cell does not have 4 vertices.");
+
+    std::array<int,4> tv = {c.verts[0], c.verts[1], c.verts[2], c.verts[3]};
+
+    const Vec3& X0 = m.points[tv[0]];
+    const Vec3& X1 = m.points[tv[1]];
+    const Vec3& X2 = m.points[tv[2]];
+    const Vec3& X3 = m.points[tv[3]];
+
+    Mat3 J;
+    J.a[0][0] = X1.x - X0.x; J.a[1][0] = X1.y - X0.y; J.a[2][0] = X1.z - X0.z;
+    J.a[0][1] = X2.x - X0.x; J.a[1][1] = X2.y - X0.y; J.a[2][1] = X2.z - X0.z;
+    J.a[0][2] = X3.x - X0.x; J.a[1][2] = X3.y - X0.y; J.a[2][2] = X3.z - X0.z;
+
+    const double detJ = det3(J);
+    const double volume = std::abs(detJ) / 6.0;
+    const Mat3 invJ = inv3(J);
+
+    const auto& gref = tet_p1_grad_ref();
+
+    std::array<Vec3,4> grad;
+    for (int a = 0; a < 4; ++a) grad[a] = invJT_mul(invJ, gref[a]);
+
+    Vec3 xc;
+    for (int a = 0; a < 4; ++a) {
+        const Vec3& X = m.points[tv[a]];
+        xc.x += 0.25 * X.x;
+        xc.y += 0.25 * X.y;
+        xc.z += 0.25 * X.z;
+    }
+
+    const double f = mms_rhs_value(xc, mms);
+
+    Real Ke[4][4] = {};
+    Real Fe[4] = {};
+
+    for (int a = 0; a < 4; ++a) {
+        Fe[a] = Real(f * volume / 4.0);
+        for (int bb = 0; bb < 4; ++bb) {
+            Ke[a][bb] = Real(dot3(grad[a], grad[bb]) * volume);
+        }
+    }
+
+    for (int a = 0; a < 4; ++a) {
+        int I = tv[a];
+        b[I] += Fe[a];
+        for (int bb = 0; bb < 4; ++bb) {
+            int Jg = tv[bb];
+            sparse_add(A, I, Jg, Ke[a][bb]);
+        }
+    }
+}
+
+static void apply_dirichlet_all_boundary(
+    const PolyMesh& m,
+    const LinearCgDofMap& dm,
+    const std::string& mms,
+    SparseRows& A,
+    std::vector<Real>& b
+) {
+    const int n = (int)A.rows.size();
+
+    // Fast Dirichlet elimination.
+    //
+    // Old one-shot implementation:
+    //   for every boundary dof d:
+    //     scan every row i and search/erase column d
+    //
+    // That is O(nBoundary * nRows * map_lookup), which becomes catastrophic
+    // for 48^3/64^3 block meshes.
+    //
+    // This version does one pass over existing nonzeros.  It preserves the
+    // same strong Dirichlet algebra:
+    //
+    //   interior rhs: b_i <- b_i - A_i,d g_d
+    //   remove boundary columns from interior rows
+    //   boundary rows become identity rows
+    //
+    // This is still temporary host SparseRows storage, but the algorithm now
+    // matches the future CSR-pattern modular path: one row-wise pass.
+    std::vector<char> isDirichlet(n, 0);
+    std::vector<Real> g(n, Real(0));
+
+    for (int d : dm.boundaryDofs) {
+        if (d < 0 || d >= n) throw std::runtime_error("Dirichlet dof out of range.");
+        isDirichlet[d] = 1;
+        g[d] = Real(mms_exact_value(m.points[d], mms));
+    }
+
+    for (int i = 0; i < n; ++i) {
+        if (isDirichlet[i]) {
+            continue;
+        }
+
+        auto& row = A.rows[i];
+        for (auto it = row.begin(); it != row.end(); ) {
+            const int j = it->first;
+            if (j >= 0 && j < n && isDirichlet[j]) {
+                b[i] -= it->second * g[j];
+                it = row.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    for (int d : dm.boundaryDofs) {
+        A.rows[d].clear();
+        A.rows[d][d] = Real(1);
+        b[d] = g[d];
+    }
+}
+
+static AssembledSystem assemble_laplacian_dirichlet_mms(
+    const PolyMesh& m,
+    const LinearCgDofMap& dm,
+    const std::string& mms
+) {
+    AssembledSystem sys;
+    sys.A.rows.resize(dm.nDofs);
+    sys.b.assign(dm.nDofs, Real(0));
+
+    if (dm.resolvedSpace == "cg_hex_q1") {
+        for (const auto& c : m.cells) {
+            assemble_hex_q1_cell(m, c, mms, sys.A, sys.b);
+        }
+    } else if (dm.resolvedSpace == "cg_tet_p1") {
+        for (const auto& c : m.cells) {
+            assemble_tet_p1_cell(m, c, mms, sys.A, sys.b);
+        }
+    } else {
+        throw std::runtime_error("Assembly unsupported for space: " + dm.resolvedSpace);
+    }
+
+    sys.nDirichlet = (int)dm.boundaryDofs.size();
+    apply_dirichlet_all_boundary(m, dm, mms, sys.A, sys.b);
+
+    return sys;
+}
+
+static void probe_assembled_system(
+    const PolyMesh& m,
+    const LinearCgDofMap& dm,
+    const AssembledSystem& sys,
+    const std::string& mms,
+    int diagLevel
+) {
+    const int n = (int)sys.A.rows.size();
+
+    double rhsL2 = 0.0;
+    double rhsMax = 0.0;
+    double minDiag = std::numeric_limits<double>::infinity();
+    double maxDiag = 0.0;
+    int missingDiag = 0;
+
+    for (int i = 0; i < n; ++i) {
+        rhsL2 += double(sys.b[i]) * double(sys.b[i]);
+        rhsMax = std::max(rhsMax, std::abs(double(sys.b[i])));
+
+        auto it = sys.A.rows[i].find(i);
+        if (it == sys.A.rows[i].end()) {
+            missingDiag++;
+        } else {
+            const double ad = std::abs(double(it->second));
+            minDiag = std::min(minDiag, ad);
+            maxDiag = std::max(maxDiag, ad);
+        }
+    }
+    rhsL2 = std::sqrt(rhsL2);
+
+    std::cout << "------------- assembly probe ---------------\n";
+    std::cout << "operator                  = laplacian(identity, u)\n";
+    std::cout << "weak form                 = int grad(v).grad(u) dOmega\n";
+    std::cout << "bc                        = Dirichlet MMS on all boundary dofs\n";
+    std::cout << "mms                       = " << mms << "\n";
+    std::cout << "space                     = " << dm.resolvedSpace << "\n";
+    std::cout << "rows                      = " << n << "\n";
+    std::cout << "nnz                       = " << sparse_nnz(sys.A) << "\n";
+    std::cout << "nDirichlet                = " << sys.nDirichlet << "\n";
+    std::cout << "rhsL2                     = " << std::setprecision(16) << rhsL2 << "\n";
+    std::cout << "rhsMax                    = " << std::setprecision(16) << rhsMax << "\n";
+    std::cout << "diagAbs min/max           = " << minDiag << " / " << maxDiag << "\n";
+    std::cout << "missingDiag               = " << missingDiag << "\n";
+
+    std::vector<Real> xExact(n, Real(0));
+    for (int i = 0; i < n; ++i) {
+        xExact[i] = Real(mms_exact_value(m.points[i], mms));
+    }
+
+    double resL2 = 0.0;
+    double resMax = 0.0;
+    for (int i = 0; i < n; ++i) {
+        const double ri = double(sparse_matvec_row(sys.A, i, xExact) - sys.b[i]);
+        resL2 += ri * ri;
+        resMax = std::max(resMax, std::abs(ri));
+    }
+    resL2 = std::sqrt(resL2);
+
+    std::cout << "exactNodalResidualL2      = " << std::setprecision(16) << resL2 << "\n";
+    std::cout << "exactNodalResidualMax     = " << std::setprecision(16) << resMax << "\n";
+
+    if (diagLevel >= 2) {
+        double symMax = 0.0;
+        for (int i = 0; i < n; ++i) {
+            for (const auto& kv : sys.A.rows[i]) {
+                int j = kv.first;
+                double aij = double(kv.second);
+                double aji = 0.0;
+                auto it = sys.A.rows[j].find(i);
+                if (it != sys.A.rows[j].end()) aji = double(it->second);
+                symMax = std::max(symMax, std::abs(aij - aji));
+            }
+        }
+        std::cout << "symmetryMaxAbs            = " << std::setprecision(16) << symMax << "\n";
+    }
+
+    std::cout << "hypre residency note      = use -hypreMemory host|device; assembly remains host-side in one-shot\n";
+    std::cout << "--------------------------------------------\n";
+}

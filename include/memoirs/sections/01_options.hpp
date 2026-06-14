@@ -1,0 +1,258 @@
+#pragma once
+
+// Auto-split from frozen patch014 one-shot source.
+// This header is intentionally included in order by apps/poisson_mms.cpp.
+
+// ============================================================================
+// SECTION 1: CLI
+// ============================================================================
+
+struct Options {
+    std::string polyMeshDir;
+    std::string space = "auto";   // auto, cg_linear, cg_hex_q1, cg_tet_p1
+    std::string mms = "linear";   // linear, sin
+    std::string solver = "pcg";    // pcg
+    std::string precond = "diagscale"; // none, diagscale, amg
+    std::string hypreMemory = "host";  // host, device
+    double tol = 1e-10;
+    int maxit = 1000;
+    int hyprePrint = 0;
+    int probeMesh = 0;
+    int probeDofs = 0;
+    int assemble = 0;
+    int solve = 0;
+    int diagLevel = 1;
+};
+
+static Options parse_cli(int argc, char** argv) {
+    Options opt;
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        auto need = [&](const char* key) -> std::string {
+            if (i + 1 >= argc) throw std::runtime_error(std::string("Missing value after ") + key);
+            return argv[++i];
+        };
+
+        if (a == "-polyMeshDir") {
+            opt.polyMeshDir = need("-polyMeshDir");
+        } else if (a == "-space") {
+            opt.space = need("-space");
+        } else if (a == "-mms") {
+            opt.mms = need("-mms");
+        } else if (a == "-solver") {
+            opt.solver = need("-solver");
+        } else if (a == "-precond") {
+            opt.precond = need("-precond");
+        } else if (a == "-hypreMemory") {
+            opt.hypreMemory = need("-hypreMemory");
+        } else if (a == "-tol") {
+            opt.tol = std::stod(need("-tol"));
+        } else if (a == "-maxit") {
+            opt.maxit = std::stoi(need("-maxit"));
+        } else if (a == "-hyprePrint") {
+            opt.hyprePrint = std::stoi(need("-hyprePrint"));
+        } else if (a == "-probeMesh") {
+            opt.probeMesh = std::stoi(need("-probeMesh"));
+        } else if (a == "-probeDofs") {
+            opt.probeDofs = std::stoi(need("-probeDofs"));
+        } else if (a == "-assemble") {
+            opt.assemble = std::stoi(need("-assemble"));
+        } else if (a == "-solve") {
+            opt.solve = std::stoi(need("-solve"));
+        } else if (a == "-diagLevel") {
+            opt.diagLevel = std::stoi(need("-diagLevel"));
+        } else if (a == "-bc" || a == "-bcMode" || a == "-boundaryMode") {
+            (void)need(a.c_str());
+        } else if (a == "-penaltySigma" || a == "-sipgSigma" || a == "-nitscheSigma" || a == "-sigma") {
+            (void)need(a.c_str());
+        } else if (a == "-kappa" || a == "-diffusion" || a == "-viscosity" || a == "-nu") {
+            (void)need(a.c_str());
+        } else if (a == "-penaltySigma" || a == "-sipgSigma" || a == "-sigma") {
+            (void)need(a.c_str());
+        } else if (a == "-h" || a == "--help") {
+            std::cout
+                << "Memoirs v0 one-shot Q1/P1 Poisson prototype\n"
+                << "Options:\n"
+                << "  -polyMeshDir <constant/polyMesh path>\n"
+                << "  -space auto|cg_linear|cg_hex_q1|cg_tet_p1\n"
+                << "  -mms linear|sin\n"
+                << "  -solver pcg\n"
+                << "  -precond none|diagscale|amg\n"
+                << "  -hypreMemory host|device\n"
+                << "  -tol <value>\n"
+                << "  -maxit <int>\n"
+                << "  -hyprePrint 0|1|2\n"
+                << "  -probeMesh 0|1\n"
+                << "  -probeDofs 0|1\n"
+                << "  -assemble 0|1\n"
+                << "  -solve 0|1\n"
+                << "  -diagLevel 0|1|2\n";
+            std::exit(0);
+        } else if (
+            a == "-quadOrder" ||
+            a == "-quadratureOrder" ||
+            a == "-gaussOrder" ||
+            a == "-volumeQuadOrder" ||
+            a == "-volQuadOrder" ||
+            a == "-faceQuadOrder" ||
+            a == "-errorQuadOrder" ||
+            a == "-vtuFile" ||
+            a == "-outputVtu" ||
+            a == "-writeVtu"
+        ) {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("Missing value after " + a);
+            }
+            ++i; // consumed later by parse_memoirs_quadrature_spec_from_cli()
+        } else {
+            throw std::runtime_error("Unknown option: " + a);
+        }
+    }
+    return opt;
+}
+
+static double seconds_since(const std::chrono::steady_clock::time_point& t0) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
+static bool memoirs_stage_timers_enabled() {
+    const char* e = std::getenv("MEMOIRS_STAGE_TIMERS");
+    if (!e) return false;
+    const std::string v(e);
+    return !(v.empty() || v == "0" || v == "false" || v == "FALSE" || v == "off" || v == "OFF");
+}
+
+static bool memoirs_compute_error_enabled() {
+    // Default = verification mode.
+    //
+    // MEMOIRS_COMPUTE_ERROR=1:
+    //   copy solution back to host and compute nodal/L2/H1 errors.
+    //
+    // MEMOIRS_COMPUTE_ERROR=0:
+    //   do not migrate x back to host after the HYPRE device solve.
+    //   This is the first production-like device-resident loop mode.
+    const char* e = std::getenv("MEMOIRS_COMPUTE_ERROR");
+    if (!e) return true;
+    const std::string v(e);
+    return !(v.empty() || v == "0" || v == "false" || v == "FALSE" || v == "off" || v == "OFF");
+}
+
+static int memoirs_solve_repeats() {
+    // Default: one solve, same behavior as before.
+    //
+    // MEMOIRS_SOLVE_REPEATS=N:
+    //   after one matrix/vector build and one PCG/AMG setup, call Solve N times.
+    //   This is a loop-readiness diagnostic: setup and device objects are reused.
+    const char* e = std::getenv("MEMOIRS_SOLVE_REPEATS");
+    if (!e) return 1;
+    int n = std::atoi(e);
+    if (n < 1) n = 1;
+    return n;
+}
+
+static std::string memoirs_rhs_update_mode() {
+    // Default: no RHS changes between repeated solves.
+    //
+    // MEMOIRS_RHS_UPDATE_MODE=none:
+    //   repeated solves reuse the same resident b.
+    //
+    // MEMOIRS_RHS_UPDATE_MODE=scale_host:
+    //   before each solve, update b on host as factor*b0, push it into the
+    //   existing IJ vector, migrate b to device, then solve.
+    //
+    // MEMOIRS_RHS_UPDATE_MODE=scale_device_inplace:
+    //   update the resident HYPRE ParVector directly on its current memory
+    //   location using HYPRE_ParVectorScale. No host migration.
+    //
+    // This is still a synthetic update, but it proves the device-resident
+    // Picard-loop vector-update path.
+    const char* e = std::getenv("MEMOIRS_RHS_UPDATE_MODE");
+    if (!e) return "none";
+
+    std::string v(e);
+    for (char& c : v) {
+        c = char(std::tolower((unsigned char)c));
+    }
+    return v;
+}
+
+
+
+
+static std::string memoirs_sparse_mode() {
+    // Default preserves the original verified row-map assembly.
+    //
+    // MEMOIRS_SPARSE_MODE=legacy:
+    //   assemble into std::map rows. This remains the verification baseline.
+    //
+    // MEMOIRS_SPARSE_MODE=fixed_csr:
+    //   build the scalar CG graph once from element connectivity and assemble
+    //   directly into flat CSR-like values through precomputed row/column slots.
+    //   This is the bridge toward reusable pressure Schur operators and GPU
+    //   assembly kernels.
+    const char* e = std::getenv("MEMOIRS_SPARSE_MODE");
+    if (!e || !*e) return "legacy";
+
+    std::string v(e);
+    for (char& c : v) c = char(std::tolower((unsigned char)c));
+
+    if (v == "legacy" || v == "map" || v == "sparse_rows" || v == "rowmap") {
+        return "legacy";
+    }
+
+    if (v == "fixed" || v == "csr" || v == "fixed_csr" ||
+        v == "fixed-pattern" || v == "fixed_pattern") {
+        return "fixed_csr";
+    }
+
+    throw std::runtime_error("Unsupported MEMOIRS_SPARSE_MODE: " + v);
+}
+
+static std::string memoirs_assembly_mode() {
+    // Default preserves patch014 behavior.
+    //
+    // MEMOIRS_ASSEMBLY_MODE=generic:
+    //   use the existing generic cell quadrature + SparseRows path.
+    //
+    // MEMOIRS_ASSEMBLY_MODE=structured_hex_q1_sumfact:
+    //   use the structured/equisized axis-aligned blockMesh Q1 hex tensor-product
+    //   assembly path. This is intentionally only for cg_hex_q1 block meshes;
+    //   tet and future generic elements stay on the generic path.
+    const char* e = std::getenv("MEMOIRS_ASSEMBLY_MODE");
+    if (!e || !*e) return "generic";
+
+    std::string v(e);
+    for (char& c : v) c = char(std::tolower((unsigned char)c));
+
+    if (v == "generic_host" || v == "generic_host_sparse" || v == "generic_host_sparse_rows") {
+        return "generic";
+    }
+
+    if (v == "sumfact" || v == "hex_sumfact" || v == "q1hex_sumfact" ||
+        v == "structured_hex" || v == "structured_hex_q1" ||
+        v == "structured_hex_q1_sumfact") {
+        return "structured_hex_q1_sumfact";
+    }
+
+    throw std::runtime_error("Unsupported MEMOIRS_ASSEMBLY_MODE: " + v);
+}
+
+static int memoirs_env_int(const char* name, int defval) {
+    const char* e = std::getenv(name);
+    if (!e || !*e) return defval;
+    return std::atoi(e);
+}
+
+static double memoirs_env_double(const char* name, double defval) {
+    const char* e = std::getenv(name);
+    if (!e || !*e) return defval;
+    return std::atof(e);
+}
+
+static bool memoirs_env_bool(const char* name, bool defval) {
+    const char* e = std::getenv(name);
+    if (!e || !*e) return defval;
+    std::string v(e);
+    for (char& c : v) c = char(std::tolower((unsigned char)c));
+    return !(v == "0" || v == "false" || v == "off" || v == "no");
+}

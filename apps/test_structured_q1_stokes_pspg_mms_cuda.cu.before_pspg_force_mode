@@ -1,0 +1,1478 @@
+#include "memoirs/diagnostics/GpuMemoryMonitor.hpp"
+#include "memoirs/diagnostics/CudaTiming.hpp"
+#include "memoirs/diagnostics/StructuredQ1StokesErrorDiagnostics.hpp"
+#include "memoirs/gpu/CudaUtils.cuh"
+#include "memoirs/gpu/DeviceBuffer.cuh"
+#include "memoirs/structured/StructuredGrid3D.hpp"
+
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#if defined(MEMOIRS_PRECISION_single)
+using Real = float;
+static constexpr const char* kPrecisionName = "single";
+#else
+using Real = double;
+static constexpr const char* kPrecisionName = "double";
+#endif
+
+namespace {
+
+struct Cli {
+    int nElem = 16;
+    int maxit = 1000;
+    double tol = 1e-10;
+    double nu = 1.0;
+    double tauScale = 0.25;
+    std::string tauMode = "simple";
+    double tauC = 4.0;
+    double tauDt = 0.0;
+    double tauAdvMag = 0.0;
+    double pGradSign = 1.0;
+    double pspgRhsSign = 1.0;
+    int printEvery = 25;
+    int repeats = 1;
+    // 0 = continuous quadrature RHS, 1 = algebraic A*x_exact RHS smoke test.
+    int rhsMode = 0;
+};
+
+static int arg_int(int& i, int argc, char** argv) {
+    if (i + 1 >= argc) throw std::runtime_error("missing integer argument");
+    return std::atoi(argv[++i]);
+}
+
+static double arg_double(int& i, int argc, char** argv) {
+    if (i + 1 >= argc) throw std::runtime_error("missing floating argument");
+    return std::atof(argv[++i]);
+}
+
+static Cli parse_cli(int argc, char** argv) {
+    Cli c;
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string a(argv[i]);
+
+        if (a == "-n" || a == "-nElem") c.nElem = arg_int(i, argc, argv);
+        else if (a == "-maxit") c.maxit = arg_int(i, argc, argv);
+        else if (a == "-tol") c.tol = arg_double(i, argc, argv);
+        else if (a == "-nu") c.nu = arg_double(i, argc, argv);
+        else if (a == "-tauScale") c.tauScale = arg_double(i, argc, argv);
+        else if (a == "-tauMode") {
+            if (i + 1 >= argc) throw std::runtime_error("missing string argument for -tauMode");
+            c.tauMode = argv[++i];
+        }
+        else if (a == "-tauC") c.tauC = arg_double(i, argc, argv);
+        else if (a == "-tauDt") c.tauDt = arg_double(i, argc, argv);
+        else if (a == "-tauAdvMag") c.tauAdvMag = arg_double(i, argc, argv);
+        else if (a == "-pGradSign") c.pGradSign = arg_double(i, argc, argv);
+        else if (a == "-pspgRhsSign") c.pspgRhsSign = arg_double(i, argc, argv);
+        else if (a == "-printEvery") c.printEvery = arg_int(i, argc, argv);
+        else if (a == "-repeats") c.repeats = arg_int(i, argc, argv);
+        else if (a == "-rhsMode") c.rhsMode = arg_int(i, argc, argv);
+        else throw std::runtime_error("unknown argument: " + a);
+    }
+
+    if (c.nElem < 2) throw std::runtime_error("-n must be >= 2");
+    if (c.maxit < 1) throw std::runtime_error("-maxit must be >= 1");
+    if (c.repeats < 1) throw std::runtime_error("-repeats must be >= 1");
+    if (!(c.nu > 0.0)) throw std::runtime_error("-nu must be positive");
+    if (!(c.tauScale > 0.0)) throw std::runtime_error("-tauScale must be positive");
+    if (!(c.tauC > 0.0)) throw std::runtime_error("-tauC must be positive");
+    if (c.tauDt < 0.0) throw std::runtime_error("-tauDt must be >= 0");
+    if (c.tauAdvMag < 0.0) throw std::runtime_error("-tauAdvMag must be >= 0");
+    if (c.tauMode != "simple" &&
+        c.tauMode != "sphere" &&
+        c.tauMode != "sphereC" &&
+        c.tauMode != "tezduyar") {
+        throw std::runtime_error("unknown -tauMode; use simple, sphere, sphereC, or tezduyar");
+    }
+    if (c.rhsMode != 0 && c.rhsMode != 1) {
+        throw std::runtime_error("-rhsMode must be 0 (continuous) or 1 (algebraic)");
+    }
+
+    return c;
+}
+
+} // namespace
+
+namespace memoirs {
+namespace gpu {
+
+inline const char* cublas_status_name(cublasStatus_t s) {
+    switch (s) {
+        case CUBLAS_STATUS_SUCCESS: return "CUBLAS_STATUS_SUCCESS";
+        case CUBLAS_STATUS_NOT_INITIALIZED: return "CUBLAS_STATUS_NOT_INITIALIZED";
+        case CUBLAS_STATUS_ALLOC_FAILED: return "CUBLAS_STATUS_ALLOC_FAILED";
+        case CUBLAS_STATUS_INVALID_VALUE: return "CUBLAS_STATUS_INVALID_VALUE";
+        case CUBLAS_STATUS_ARCH_MISMATCH: return "CUBLAS_STATUS_ARCH_MISMATCH";
+        case CUBLAS_STATUS_MAPPING_ERROR: return "CUBLAS_STATUS_MAPPING_ERROR";
+        case CUBLAS_STATUS_EXECUTION_FAILED: return "CUBLAS_STATUS_EXECUTION_FAILED";
+        case CUBLAS_STATUS_INTERNAL_ERROR: return "CUBLAS_STATUS_INTERNAL_ERROR";
+        case CUBLAS_STATUS_NOT_SUPPORTED: return "CUBLAS_STATUS_NOT_SUPPORTED";
+        case CUBLAS_STATUS_LICENSE_ERROR: return "CUBLAS_STATUS_LICENSE_ERROR";
+        default: return "CUBLAS_STATUS_UNKNOWN";
+    }
+}
+
+inline void cublas_check(cublasStatus_t s, const char* file, int line, const char* expr) {
+    if (s != CUBLAS_STATUS_SUCCESS) {
+        throw std::runtime_error(
+            std::string("cuBLAS error at ") + file + ":" + std::to_string(line) +
+            " expr=" + expr + " status=" + cublas_status_name(s));
+    }
+}
+
+#define MEMOIRS_LOCAL_CUBLAS_CHECK(expr) \
+    ::memoirs::gpu::cublas_check((expr), __FILE__, __LINE__, #expr)
+
+class CublasHandleLocal {
+public:
+    CublasHandleLocal() {
+        MEMOIRS_LOCAL_CUBLAS_CHECK(cublasCreate(&h_));
+        MEMOIRS_LOCAL_CUBLAS_CHECK(cublasSetPointerMode(h_, CUBLAS_POINTER_MODE_HOST));
+    }
+
+    CublasHandleLocal(const CublasHandleLocal&) = delete;
+    CublasHandleLocal& operator=(const CublasHandleLocal&) = delete;
+
+    ~CublasHandleLocal() {
+        if (h_) cublasDestroy(h_);
+    }
+
+    cublasHandle_t get() const { return h_; }
+
+private:
+    cublasHandle_t h_ = nullptr;
+};
+
+inline cublasStatus_t cublas_dot_dispatch_local(cublasHandle_t h,
+                                                int n,
+                                                const double* a,
+                                                const double* b,
+                                                double* out) {
+    return cublasDdot(h, n, a, 1, b, 1, out);
+}
+
+inline cublasStatus_t cublas_dot_dispatch_local(cublasHandle_t h,
+                                                int n,
+                                                const float* a,
+                                                const float* b,
+                                                float* out) {
+    return cublasSdot(h, n, a, 1, b, 1, out);
+}
+
+template <class RealT>
+class GpuDotLocal {
+public:
+    double dot(int n, const RealT* a, const RealT* b) {
+        RealT out = RealT(0);
+        MEMOIRS_LOCAL_CUBLAS_CHECK(cublas_dot_dispatch_local(handle_.get(), n, a, b, &out));
+        return double(out);
+    }
+
+private:
+    CublasHandleLocal handle_;
+};
+
+struct Grid3DCudaLocal {
+    int nx = 0;
+    int ny = 0;
+    int nz = 0;
+    double hx = 0.0;
+    double hy = 0.0;
+    double hz = 0.0;
+
+    __host__ __device__ int n_nodes_host() const { return nx * ny * nz; }
+};
+
+__host__ inline Grid3DCudaLocal to_cuda_grid_local(
+    const memoirs::structured::StructuredGrid3D& g) {
+    Grid3DCudaLocal d;
+    d.nx = g.nx;
+    d.ny = g.ny;
+    d.nz = g.nz;
+    d.hx = g.hx();
+    d.hy = g.hy();
+    d.hz = g.hz();
+    return d;
+}
+
+__host__ __device__ inline int g_id_local(const Grid3DCudaLocal g,
+                                          int i,
+                                          int j,
+                                          int k) {
+    return (k * g.ny + j) * g.nx + i;
+}
+
+__host__ __device__ inline bool g_boundary_local(const Grid3DCudaLocal g,
+                                                 int i,
+                                                 int j,
+                                                 int k) {
+    return i == 0 || j == 0 || k == 0 ||
+           i == g.nx - 1 || j == g.ny - 1 || k == g.nz - 1;
+}
+
+inline int div_up_local(int n, int block) {
+    return (n + block - 1) / block;
+}
+
+template <class RealT>
+__global__ void kernel_zero_local(int n, RealT* x) {
+    const int q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q < n) x[q] = RealT(0);
+}
+
+template <class RealT>
+__global__ void kernel_copy_local(int n, const RealT* a, RealT* b) {
+    const int q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q < n) b[q] = a[q];
+}
+
+template <class RealT>
+__global__ void kernel_subtract_local(int n, const RealT* a, const RealT* b, RealT* r) {
+    const int q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q < n) r[q] = a[q] - b[q];
+}
+
+template <class RealT>
+__global__ void kernel_axpby_local(int n,
+                                   RealT a,
+                                   const RealT* x,
+                                   RealT b,
+                                   RealT* y) {
+    const int q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q < n) y[q] = a * x[q] + b * y[q];
+}
+
+template <class RealT>
+__global__ void kernel_combination3_local(int n,
+                                          RealT a,
+                                          const RealT* x,
+                                          RealT b,
+                                          const RealT* y,
+                                          RealT c,
+                                          const RealT* z,
+                                          RealT* out) {
+    const int q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q < n) out[q] = a * x[q] + b * y[q] + c * z[q];
+}
+
+template <class RealT>
+__host__ __device__ inline RealT stokes_local_ke_q1(const Grid3DCudaLocal g,
+                                           int ra,
+                                           int ca) {
+    const int rix = ra & 1;
+    const int riy = (ra >> 1) & 1;
+    const int riz = (ra >> 2) & 1;
+
+    const int cix = ca & 1;
+    const int ciy = (ca >> 1) & 1;
+    const int ciz = (ca >> 2) & 1;
+
+    const RealT M[2][2] = {
+        {RealT(2.0 / 3.0), RealT(1.0 / 3.0)},
+        {RealT(1.0 / 3.0), RealT(2.0 / 3.0)}
+    };
+
+    const RealT K[2][2] = {
+        {RealT(0.5), RealT(-0.5)},
+        {RealT(-0.5), RealT(0.5)}
+    };
+
+    const RealT hx = RealT(g.hx);
+    const RealT hy = RealT(g.hy);
+    const RealT hz = RealT(g.hz);
+
+    const RealT cx = hy * hz / (RealT(2) * hx);
+    const RealT cy = hx * hz / (RealT(2) * hy);
+    const RealT cz = hx * hy / (RealT(2) * hz);
+
+    return cx * K[rix][cix] * M[riy][ciy] * M[riz][ciz] +
+           cy * M[rix][cix] * K[riy][ciy] * M[riz][ciz] +
+           cz * M[rix][cix] * M[riy][ciy] * K[riz][ciz];
+}
+
+__device__ inline int stokes_local_node_id(const Grid3DCudaLocal g,
+                                           int ex,
+                                           int ey,
+                                           int ez,
+                                           int a) {
+    const int ix = a & 1;
+    const int iy = (a >> 1) & 1;
+    const int iz = (a >> 2) & 1;
+    return g_id_local(g, ex + ix, ey + iy, ez + iz);
+}
+
+template <class RealT>
+__host__ __device__ inline RealT stokes_local_b_q1(const Grid3DCudaLocal g,
+                                          int qa,
+                                          int ub,
+                                          int comp) {
+    const RealT gp = RealT(0.577350269189625764509148780501957456);
+    const RealT q[2] = {-gp, gp};
+
+    const RealT hx = RealT(g.hx);
+    const RealT hy = RealT(g.hy);
+    const RealT hz = RealT(g.hz);
+    const RealT jac = hx * hy * hz / RealT(8);
+
+    RealT val = RealT(0);
+
+    for (int iq = 0; iq < 2; ++iq) {
+        const RealT xi = q[iq];
+        const RealT Nx[2] = {RealT(0.5) * (RealT(1) - xi),
+                             RealT(0.5) * (RealT(1) + xi)};
+        const RealT dNx[2] = {RealT(-1) / hx, RealT(1) / hx};
+
+        for (int jq = 0; jq < 2; ++jq) {
+            const RealT eta = q[jq];
+            const RealT Ny[2] = {RealT(0.5) * (RealT(1) - eta),
+                                 RealT(0.5) * (RealT(1) + eta)};
+            const RealT dNy[2] = {RealT(-1) / hy, RealT(1) / hy};
+
+            for (int kq = 0; kq < 2; ++kq) {
+                const RealT zeta = q[kq];
+                const RealT Nz[2] = {RealT(0.5) * (RealT(1) - zeta),
+                                     RealT(0.5) * (RealT(1) + zeta)};
+                const RealT dNz[2] = {RealT(-1) / hz, RealT(1) / hz};
+
+                const int qx = qa & 1;
+                const int qy = (qa >> 1) & 1;
+                const int qz = (qa >> 2) & 1;
+
+                const int ux = ub & 1;
+                const int uy = (ub >> 1) & 1;
+                const int uz = (ub >> 2) & 1;
+
+                const RealT Na = Nx[qx] * Ny[qy] * Nz[qz];
+
+                RealT dNb = RealT(0);
+                if (comp == 0) dNb = dNx[ux] * Ny[uy] * Nz[uz];
+                else if (comp == 1) dNb = Nx[ux] * dNy[uy] * Nz[uz];
+                else dNb = Nx[ux] * Ny[uy] * dNz[uz];
+
+                val += Na * dNb * jac;
+            }
+        }
+    }
+
+    return val;
+}
+
+__device__ inline void stokes_mms_exact_device(double x,
+                                               double y,
+                                               double z,
+                                               double& u,
+                                               double& v,
+                                               double& w,
+                                               double& p) {
+    const double pi = 3.141592653589793238462643383279502884;
+
+    const double sx = sin(pi * x);
+    const double sy = sin(pi * y);
+    const double sz = sin(pi * z);
+    const double cx = cos(pi * x);
+    const double cy = cos(pi * y);
+
+    u = 2.0 * pi * sx * sx * sy * cy * sz * sz;
+    v = -2.0 * pi * sx * cx * sy * sy * sz * sz;
+    w = 0.0;
+    p = sx * sy * sz;
+}
+
+__device__ inline void stokes_mms_force_device(double x,
+                                               double y,
+                                               double z,
+                                               double nu,
+                                               double pGradSign,
+                                               double& fx,
+                                               double& fy,
+                                               double& fz) {
+    const double pi = 3.141592653589793238462643383279502884;
+
+    const double sx = sin(pi * x);
+    const double sy = sin(pi * y);
+    const double sz = sin(pi * z);
+    const double cx = cos(pi * x);
+    const double cy = cos(pi * y);
+    const double cz = cos(pi * z);
+
+    const double c2x = cos(2.0 * pi * x);
+    const double c2y = cos(2.0 * pi * y);
+    const double c2z = cos(2.0 * pi * z);
+
+    const double A = sx * sx;
+    const double B = sy * cy;
+    const double C = sz * sz;
+    const double D = sx * cx;
+    const double E = sy * sy;
+
+    const double lap_u =
+        4.0 * pi * pi * pi * B *
+        (c2x * C - 2.0 * A * C + A * c2z);
+
+    const double lap_v =
+        8.0 * pi * pi * pi * D * E * C -
+        4.0 * pi * pi * pi * D * c2y * C -
+        4.0 * pi * pi * pi * D * E * c2z;
+
+    const double px = pi * cx * sy * sz;
+    const double py = pi * sx * cy * sz;
+    const double pz = pi * sx * sy * cz;
+
+    fx = -nu * lap_u + pGradSign * px;
+    fy = -nu * lap_v + pGradSign * py;
+    fz = pGradSign * pz;
+}
+
+template <class RealT>
+__global__ void kernel_fill_stokes_exact(Grid3DCudaLocal g, RealT* x) {
+    const int nn = g.n_nodes_host();
+    const int q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q >= nn) return;
+
+    const int i = q % g.nx;
+    const int tmp = q / g.nx;
+    const int j = tmp % g.ny;
+    const int k = tmp / g.ny;
+
+    const double xx = double(i) * g.hx;
+    const double yy = double(j) * g.hy;
+    const double zz = double(k) * g.hz;
+
+    double u, v, w, p;
+    stokes_mms_exact_device(xx, yy, zz, u, v, w, p);
+
+    x[q] = RealT(u);
+    x[nn + q] = RealT(v);
+    x[2 * nn + q] = RealT(w);
+    x[3 * nn + q] = RealT(p);
+}
+
+template <class RealT>
+__global__ void kernel_apply_stokes_pspg_elements(Grid3DCudaLocal g,
+                                                  RealT nu,
+                                                  RealT tau,
+                                                  const RealT* x,
+                                                  RealT* y) {
+    const int nn = g.n_nodes_host();
+    const int exN = g.nx - 1;
+    const int eyN = g.ny - 1;
+    const int ezN = g.nz - 1;
+    const int nElem = exN * eyN * ezN;
+
+    const int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= nElem) return;
+
+    const int ex = e % exN;
+    const int tmp = e / exN;
+    const int ey = tmp % eyN;
+    const int ez = tmp / eyN;
+
+    constexpr int pPin = 0;
+
+    for (int a = 0; a < 8; ++a) {
+        const int rowNode = stokes_local_node_id(g, ex, ey, ez, a);
+        const int ai = rowNode % g.nx;
+        const int atmp = rowNode / g.nx;
+        const int aj = atmp % g.ny;
+        const int ak = atmp / g.ny;
+
+        const bool rowBoundary = g_boundary_local(g, ai, aj, ak);
+
+        if (!rowBoundary) {
+            RealT yu[3] = {RealT(0), RealT(0), RealT(0)};
+
+            for (int b = 0; b < 8; ++b) {
+                const int colNode = stokes_local_node_id(g, ex, ey, ez, b);
+                const int bi = colNode % g.nx;
+                const int btmp = colNode / g.nx;
+                const int bj = btmp % g.ny;
+                const int bk = btmp / g.ny;
+                const bool colBoundary = g_boundary_local(g, bi, bj, bk);
+
+                const RealT ke = stokes_local_ke_q1<RealT>(g, a, b);
+
+                if (!colBoundary) {
+                    yu[0] += nu * ke * x[colNode];
+                    yu[1] += nu * ke * x[nn + colNode];
+                    yu[2] += nu * ke * x[2 * nn + colNode];
+                }
+
+                if (colNode != pPin) {
+                    const RealT bx = stokes_local_b_q1<RealT>(g, b, a, 0);
+                    const RealT by = stokes_local_b_q1<RealT>(g, b, a, 1);
+                    const RealT bz = stokes_local_b_q1<RealT>(g, b, a, 2);
+                    const RealT pp = x[3 * nn + colNode];
+
+                    // Weak momentum pressure coupling: -(p, div v).
+                    yu[0] -= bx * pp;
+                    yu[1] -= by * pp;
+                    yu[2] -= bz * pp;
+                }
+            }
+
+            atomicAdd(&y[rowNode], yu[0]);
+            atomicAdd(&y[nn + rowNode], yu[1]);
+            atomicAdd(&y[2 * nn + rowNode], yu[2]);
+        }
+
+        if (rowNode != pPin) {
+            RealT yp = RealT(0);
+
+            for (int b = 0; b < 8; ++b) {
+                const int colNode = stokes_local_node_id(g, ex, ey, ez, b);
+                const int bi = colNode % g.nx;
+                const int btmp = colNode / g.nx;
+                const int bj = btmp % g.ny;
+                const int bk = btmp / g.ny;
+                const bool colBoundary = g_boundary_local(g, bi, bj, bk);
+
+                if (!colBoundary) {
+                    const RealT bx = stokes_local_b_q1<RealT>(g, a, b, 0);
+                    const RealT by = stokes_local_b_q1<RealT>(g, a, b, 1);
+                    const RealT bz = stokes_local_b_q1<RealT>(g, a, b, 2);
+
+                    yp += bx * x[colNode];
+                    yp += by * x[nn + colNode];
+                    yp += bz * x[2 * nn + colNode];
+                }
+
+                if (colNode != pPin) {
+                    const RealT ke = stokes_local_ke_q1<RealT>(g, a, b);
+                    yp += tau * ke * x[3 * nn + colNode];
+                }
+            }
+
+            atomicAdd(&y[3 * nn + rowNode], yp);
+        }
+    }
+}
+
+template <class RealT>
+__global__ void kernel_apply_stokes_strong_rows(Grid3DCudaLocal g,
+                                                const RealT* x,
+                                                RealT* y) {
+    const int nn = g.n_nodes_host();
+    const int q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q >= nn) return;
+
+    const int i = q % g.nx;
+    const int tmp = q / g.nx;
+    const int j = tmp % g.ny;
+    const int k = tmp / g.ny;
+
+    if (g_boundary_local(g, i, j, k)) {
+        y[q] = x[q];
+        y[nn + q] = x[nn + q];
+        y[2 * nn + q] = x[2 * nn + q];
+    }
+
+    if (q == 0) {
+        y[3 * nn + q] = x[3 * nn + q];
+    }
+}
+
+template <class RealT>
+__global__ void kernel_assemble_stokes_rhs_elements(Grid3DCudaLocal g,
+                                                    RealT nu,
+                                                    RealT tau,
+                                                    RealT pGradSign,
+                                                    RealT pspgRhsSign,
+                                                    RealT* rhs) {
+    const int nn = g.n_nodes_host();
+    const int exN = g.nx - 1;
+    const int eyN = g.ny - 1;
+    const int ezN = g.nz - 1;
+    const int nElem = exN * eyN * ezN;
+
+    const int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= nElem) return;
+
+    const int ex = e % exN;
+    const int tmp = e / exN;
+    const int ey = tmp % eyN;
+    const int ez = tmp / eyN;
+
+    const double qp[4] = {
+        -0.86113631159405257522,
+        -0.33998104358485626480,
+         0.33998104358485626480,
+         0.86113631159405257522
+    };
+
+    const double qw[4] = {
+        0.34785484513745385737,
+        0.65214515486254614263,
+        0.65214515486254614263,
+        0.34785484513745385737
+    };
+
+    const double hx = g.hx;
+    const double hy = g.hy;
+    const double hz = g.hz;
+    const double jac = hx * hy * hz / 8.0;
+
+    for (int iq = 0; iq < 4; ++iq) {
+        const double xi = qp[iq];
+        const double wx = qw[iq];
+        const double Nx[2] = {0.5 * (1.0 - xi), 0.5 * (1.0 + xi)};
+        const double dNx[2] = {-1.0 / hx, 1.0 / hx};
+        const double xx = (double(ex) + 0.5 * (1.0 + xi)) * hx;
+
+        for (int jq = 0; jq < 4; ++jq) {
+            const double eta = qp[jq];
+            const double wy = qw[jq];
+            const double Ny[2] = {0.5 * (1.0 - eta), 0.5 * (1.0 + eta)};
+            const double dNy[2] = {-1.0 / hy, 1.0 / hy};
+            const double yy = (double(ey) + 0.5 * (1.0 + eta)) * hy;
+
+            for (int kq = 0; kq < 4; ++kq) {
+                const double zeta = qp[kq];
+                const double wz = qw[kq];
+                const double Nz[2] = {0.5 * (1.0 - zeta), 0.5 * (1.0 + zeta)};
+                const double dNz[2] = {-1.0 / hz, 1.0 / hz};
+                const double zz = (double(ez) + 0.5 * (1.0 + zeta)) * hz;
+
+                double fx, fy, fz;
+                stokes_mms_force_device(xx, yy, zz, double(nu), double(pGradSign), fx, fy, fz);
+
+                const double wq = wx * wy * wz * jac;
+
+                for (int a = 0; a < 8; ++a) {
+                    const int ax = a & 1;
+                    const int ay = (a >> 1) & 1;
+                    const int az = (a >> 2) & 1;
+
+                    const int rowNode = stokes_local_node_id(g, ex, ey, ez, a);
+                    const int ri = rowNode % g.nx;
+                    const int rtmp = rowNode / g.nx;
+                    const int rj = rtmp % g.ny;
+                    const int rk = rtmp / g.ny;
+                    const bool rowBoundary = g_boundary_local(g, ri, rj, rk);
+
+                    const double Na = Nx[ax] * Ny[ay] * Nz[az];
+                    const double dNadx = dNx[ax] * Ny[ay] * Nz[az];
+                    const double dNady = Nx[ax] * dNy[ay] * Nz[az];
+                    const double dNadz = Nx[ax] * Ny[ay] * dNz[az];
+
+                    if (!rowBoundary) {
+                        atomicAdd(&rhs[rowNode], RealT(Na * fx * wq));
+                        atomicAdd(&rhs[nn + rowNode], RealT(Na * fy * wq));
+                        atomicAdd(&rhs[2 * nn + rowNode], RealT(Na * fz * wq));
+                    }
+
+                    if (rowNode != 0) {
+                        // Q1 has zero elementwise second derivatives, so PSPG contributes
+                        // tau * (grad q, grad p - f) = 0 as tau*(grad q, grad p) on the
+                        // left and tau*(grad q, f) on the right for the Stokes MMS.
+                        const double pspg = double(pspgRhsSign) * double(tau) *
+                            (dNadx * fx + dNady * fy + dNadz * fz) * wq;
+                        atomicAdd(&rhs[3 * nn + rowNode], RealT(pspg));
+                    }
+                }
+            }
+        }
+    }
+}
+
+template <class RealT>
+__global__ void kernel_apply_stokes_rhs_strong_rows(Grid3DCudaLocal g, RealT* rhs) {
+    const int nn = g.n_nodes_host();
+    const int q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q >= nn) return;
+
+    const int i = q % g.nx;
+    const int tmp = q / g.nx;
+    const int j = tmp % g.ny;
+    const int k = tmp / g.ny;
+
+    if (g_boundary_local(g, i, j, k)) {
+        rhs[q] = RealT(0);
+        rhs[nn + q] = RealT(0);
+        rhs[2 * nn + q] = RealT(0);
+    }
+
+    if (q == 0) rhs[3 * nn + q] = RealT(0);
+}
+
+
+template <class RealT>
+__global__ void kernel_stokes_diag_prec(Grid3DCudaLocal g,
+                                        RealT nu,
+                                        RealT tau,
+                                        const RealT* r,
+                                        RealT* z) {
+    const int nn = g.n_nodes_host();
+    const int q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q >= nn) return;
+
+    const int i = q % g.nx;
+    const int tmp = q / g.nx;
+    const int j = tmp % g.ny;
+    const int k = tmp / g.ny;
+
+    const bool bnd = g_boundary_local(g, i, j, k);
+    constexpr int pPin = 0;
+
+    RealT kdiag = RealT(0);
+    RealT B[3] = {RealT(0), RealT(0), RealT(0)};
+    RealT G[3] = {RealT(0), RealT(0), RealT(0)};
+
+    const int ex0 = max(0, i - 1);
+    const int ex1 = min(g.nx - 2, i);
+    const int ey0 = max(0, j - 1);
+    const int ey1 = min(g.ny - 2, j);
+    const int ez0 = max(0, k - 1);
+    const int ez1 = min(g.nz - 2, k);
+
+    for (int ez = ez0; ez <= ez1; ++ez) {
+        for (int ey = ey0; ey <= ey1; ++ey) {
+            for (int ex = ex0; ex <= ex1; ++ex) {
+                const int lx = i - ex;
+                const int ly = j - ey;
+                const int lz = k - ez;
+                const int a = lx + 2 * ly + 4 * lz;
+
+                kdiag += stokes_local_ke_q1<RealT>(g, a, a);
+
+                if (!bnd && q != pPin) {
+                    const RealT bx = stokes_local_b_q1<RealT>(g, a, a, 0);
+                    const RealT by = stokes_local_b_q1<RealT>(g, a, a, 1);
+                    const RealT bz = stokes_local_b_q1<RealT>(g, a, a, 2);
+
+                    B[0] += bx;
+                    B[1] += by;
+                    B[2] += bz;
+
+                    // Momentum pressure block uses -(p, div v).
+                    G[0] -= bx;
+                    G[1] -= by;
+                    G[2] -= bz;
+                }
+            }
+        }
+    }
+
+    const RealT dU = bnd ? RealT(1) : max(nu * kdiag, RealT(1e-30));
+    const RealT dP = (q == pPin) ? RealT(1) : max(tau * kdiag, RealT(1e-30));
+
+    if (bnd || q == pPin) {
+        if (bnd) {
+            z[q] = r[q];
+            z[nn + q] = r[nn + q];
+            z[2 * nn + q] = r[2 * nn + q];
+        } else {
+            z[q] = r[q] / dU;
+            z[nn + q] = r[nn + q] / dU;
+            z[2 * nn + q] = r[2 * nn + q] / dU;
+        }
+
+        if (q == pPin) z[3 * nn + q] = r[3 * nn + q];
+        else z[3 * nn + q] = r[3 * nn + q] / dP;
+        return;
+    }
+
+    // Local nodal 4x4 block:
+    //
+    // [dU 0  0  Gx] [zu]   [ru]
+    // [0 dU  0  Gy] [zv] = [rv]
+    // [0  0 dU  Gz] [zw]   [rw]
+    // [Bx By Bz dP] [zp]   [rp]
+    const RealT ru0 = r[q];
+    const RealT ru1 = r[nn + q];
+    const RealT ru2 = r[2 * nn + q];
+    const RealT rp = r[3 * nn + q];
+
+    const RealT invDU = RealT(1) / dU;
+
+    RealT schur = dP - (B[0] * G[0] + B[1] * G[1] + B[2] * G[2]) * invDU;
+    const RealT absSchur = schur >= RealT(0) ? schur : -schur;
+    if (!(absSchur > RealT(1e-30))) {
+        schur = (schur >= RealT(0) ? RealT(1e-30) : RealT(-1e-30));
+    }
+
+    const RealT rhsP = rp - (B[0] * ru0 + B[1] * ru1 + B[2] * ru2) * invDU;
+    const RealT zp = rhsP / schur;
+
+    z[q] = (ru0 - G[0] * zp) * invDU;
+    z[nn + q] = (ru1 - G[1] * zp) * invDU;
+    z[2 * nn + q] = (ru2 - G[2] * zp) * invDU;
+    z[3 * nn + q] = zp;
+}
+
+template <class RealT>
+void stokes_print_nodal4_diag_audit(const memoirs::structured::StructuredGrid3D& grid,
+                                    Grid3DCudaLocal g,
+                                    RealT nu,
+                                    RealT tau,
+                                    std::ostream& os) {
+    const int nn = grid.n_nodes();
+    constexpr int pPin = 0;
+
+    double maxAbsB = 0.0;
+    double maxAbsG = 0.0;
+    double maxAbsBG = 0.0;
+    double minAbsSchur = std::numeric_limits<double>::infinity();
+    double maxAbsSchur = 0.0;
+    int coupledNodes = 0;
+    int freeNodes = 0;
+
+    for (int q = 0; q < nn; ++q) {
+        const int i = q % g.nx;
+        const int tmp = q / g.nx;
+        const int j = tmp % g.ny;
+        const int k = tmp / g.ny;
+
+        const bool bnd = g_boundary_local(g, i, j, k);
+
+        double kdiag = 0.0;
+        double B[3] = {0.0, 0.0, 0.0};
+        double Gv[3] = {0.0, 0.0, 0.0};
+
+        const int ex0 = std::max(0, i - 1);
+        const int ex1 = std::min(g.nx - 2, i);
+        const int ey0 = std::max(0, j - 1);
+        const int ey1 = std::min(g.ny - 2, j);
+        const int ez0 = std::max(0, k - 1);
+        const int ez1 = std::min(g.nz - 2, k);
+
+        for (int ez = ez0; ez <= ez1; ++ez) {
+            for (int ey = ey0; ey <= ey1; ++ey) {
+                for (int ex = ex0; ex <= ex1; ++ex) {
+                    const int lx = i - ex;
+                    const int ly = j - ey;
+                    const int lz = k - ez;
+                    const int a = lx + 2 * ly + 4 * lz;
+
+                    kdiag += double(stokes_local_ke_q1<RealT>(g, a, a));
+
+                    if (!bnd && q != pPin) {
+                        const double bx = double(stokes_local_b_q1<RealT>(g, a, a, 0));
+                        const double by = double(stokes_local_b_q1<RealT>(g, a, a, 1));
+                        const double bz = double(stokes_local_b_q1<RealT>(g, a, a, 2));
+
+                        B[0] += bx;
+                        B[1] += by;
+                        B[2] += bz;
+
+                        Gv[0] -= bx;
+                        Gv[1] -= by;
+                        Gv[2] -= bz;
+                    }
+                }
+            }
+        }
+
+        if (!bnd && q != pPin) {
+            ++freeNodes;
+
+            const double dU = std::max(double(nu) * kdiag, 1e-300);
+            const double dP = std::max(double(tau) * kdiag, 1e-300);
+            const double Bnorm = std::sqrt(B[0]*B[0] + B[1]*B[1] + B[2]*B[2]);
+            const double Gnorm = std::sqrt(Gv[0]*Gv[0] + Gv[1]*Gv[1] + Gv[2]*Gv[2]);
+            const double BG = B[0]*Gv[0] + B[1]*Gv[1] + B[2]*Gv[2];
+            const double schur = dP - BG / dU;
+
+            maxAbsB = std::max(maxAbsB, Bnorm);
+            maxAbsG = std::max(maxAbsG, Gnorm);
+            maxAbsBG = std::max(maxAbsBG, std::abs(BG));
+            minAbsSchur = std::min(minAbsSchur, std::abs(schur));
+            maxAbsSchur = std::max(maxAbsSchur, std::abs(schur));
+
+            if (Bnorm > 1e-30 || Gnorm > 1e-30) ++coupledNodes;
+        }
+    }
+
+    if (!std::isfinite(minAbsSchur)) minAbsSchur = 0.0;
+
+    os << "--------------- stokes nodal preconditioner audit ---------------\n";
+    os << "preconditionerType        = nodal_4x4_inverse_diagonal\n";
+    os << std::setprecision(17);
+    os << "freeInteriorPressureNodes = " << freeNodes << "\n";
+    os << "sameNodeCoupledNodes      = " << coupledNodes << "\n";
+    os << "maxSameNodeBNorm          = " << maxAbsB << "\n";
+    os << "maxSameNodeGNorm          = " << maxAbsG << "\n";
+    os << "maxAbsBdotG               = " << maxAbsBG << "\n";
+    os << "minAbsLocalSchur          = " << minAbsSchur << "\n";
+    os << "maxAbsLocalSchur          = " << maxAbsSchur << "\n";
+    if (coupledNodes == 0) {
+        os << "auditNote                 = same-node Q1 grad/div coupling cancels; this block is effectively scalar diagonal on interiors\n";
+    }
+    os << "------------------------------------------------------------------\n";
+}
+
+
+template <class RealT>
+RealT stokes_compute_tau_host(const memoirs::structured::StructuredGrid3D& grid,
+                              RealT nu,
+                              RealT tauScale,
+                              const std::string& tauMode,
+                              RealT tauC,
+                              RealT tauDt,
+                              RealT tauAdvMag) {
+    const RealT hx = RealT(grid.hx());
+    const RealT hy = RealT(grid.hy());
+    const RealT hz = RealT(grid.hz());
+
+    const RealT hmin = std::min({hx, hy, hz});
+    const RealT volume = hx * hy * hz;
+    const RealT pi = RealT(3.141592653589793238462643383279502884);
+    const RealT hEq = std::pow(RealT(6) * volume / pi, RealT(1.0 / 3.0));
+
+    if (tauMode == "simple") {
+        return tauScale * hmin * hmin / nu;
+    }
+
+    if (tauMode == "sphere" || tauMode == "sphereC") {
+        return tauScale * hEq * hEq / (tauC * nu);
+    }
+
+    if (tauMode == "tezduyar") {
+        RealT invTau2 = RealT(0);
+
+        if (tauDt > RealT(0)) {
+            const RealT t = RealT(2) / tauDt;
+            invTau2 += t * t;
+        }
+
+        if (tauAdvMag > RealT(0)) {
+            const RealT a = tauAdvMag / hEq;
+            invTau2 += a * a;
+        }
+
+        const RealT d = tauC * nu / (hEq * hEq);
+        invTau2 += d * d;
+
+        return tauScale / std::sqrt(invTau2);
+    }
+
+    return tauScale * hmin * hmin / nu;
+}
+
+template <class RealT>
+RealT stokes_hmin_host(const memoirs::structured::StructuredGrid3D& grid) {
+    return RealT(std::min({grid.hx(), grid.hy(), grid.hz()}));
+}
+
+template <class RealT>
+RealT stokes_heq_host(const memoirs::structured::StructuredGrid3D& grid) {
+    const RealT hx = RealT(grid.hx());
+    const RealT hy = RealT(grid.hy());
+    const RealT hz = RealT(grid.hz());
+    const RealT volume = hx * hy * hz;
+    const RealT pi = RealT(3.141592653589793238462643383279502884);
+    return std::pow(RealT(6) * volume / pi, RealT(1.0 / 3.0));
+}
+
+template <class RealT>
+class StructuredStokesPspgOperator {
+public:
+    StructuredStokesPspgOperator(const memoirs::structured::StructuredGrid3D& grid,
+                                 RealT nu,
+                                 RealT tauScale,
+                                 const std::string& tauMode,
+                                 RealT tauC,
+                                 RealT tauDt,
+                                 RealT tauAdvMag,
+                                 RealT pGradSign,
+                                 RealT pspgRhsSign)
+        : grid_(grid),
+          dg_(to_cuda_grid_local(grid)),
+          nu_(nu),
+          tauScale_(tauScale),
+          tauMode_(tauMode),
+          tauC_(tauC),
+          tauDt_(tauDt),
+          tauAdvMag_(tauAdvMag),
+          pGradSign_(pGradSign),
+          pspgRhsSign_(pspgRhsSign) {
+        hMin_ = stokes_hmin_host<RealT>(grid_);
+        hEq_ = stokes_heq_host<RealT>(grid_);
+        tau_ = stokes_compute_tau_host<RealT>(
+            grid_, nu_, tauScale_, tauMode_, tauC_, tauDt_, tauAdvMag_);
+    }
+
+    int size() const { return 4 * grid_.n_nodes(); }
+    int scalar_size() const { return grid_.n_nodes(); }
+    RealT tau() const { return tau_; }
+
+    const memoirs::structured::StructuredGrid3D& grid() const { return grid_; }
+
+    void apply(const RealT* x, RealT* y) const {
+        const int nn = grid_.n_nodes();
+        const int total = 4 * nn;
+        const int nElem = (grid_.nx - 1) * (grid_.ny - 1) * (grid_.nz - 1);
+        const int block = 256;
+
+        kernel_zero_local<RealT><<<div_up_local(total, block), block>>>(total, y);
+        MEMOIRS_CUDA_KERNEL_CHECK();
+
+        kernel_apply_stokes_pspg_elements<RealT>
+            <<<div_up_local(nElem, block), block>>>(dg_, nu_, tau_, x, y);
+        MEMOIRS_CUDA_KERNEL_CHECK();
+
+        kernel_apply_stokes_strong_rows<RealT>
+            <<<div_up_local(nn, block), block>>>(dg_, x, y);
+        MEMOIRS_CUDA_KERNEL_CHECK();
+    }
+
+    void assemble_rhs_continuous(RealT* rhs) const {
+        const int nn = grid_.n_nodes();
+        const int total = 4 * nn;
+        const int nElem = (grid_.nx - 1) * (grid_.ny - 1) * (grid_.nz - 1);
+        const int block = 256;
+
+        kernel_zero_local<RealT><<<div_up_local(total, block), block>>>(total, rhs);
+        MEMOIRS_CUDA_KERNEL_CHECK();
+
+        kernel_assemble_stokes_rhs_elements<RealT>
+            <<<div_up_local(nElem, block), block>>>(dg_, nu_, tau_, pGradSign_, pspgRhsSign_, rhs);
+        MEMOIRS_CUDA_KERNEL_CHECK();
+
+        kernel_apply_stokes_rhs_strong_rows<RealT>
+            <<<div_up_local(nn, block), block>>>(dg_, rhs);
+        MEMOIRS_CUDA_KERNEL_CHECK();
+    }
+
+    void fill_exact(RealT* x) const {
+        const int nn = grid_.n_nodes();
+        const int block = 256;
+        kernel_fill_stokes_exact<RealT><<<div_up_local(nn, block), block>>>(dg_, x);
+        MEMOIRS_CUDA_KERNEL_CHECK();
+    }
+
+private:
+    memoirs::structured::StructuredGrid3D grid_;
+    Grid3DCudaLocal dg_;
+    RealT nu_;
+    RealT tau_;
+    RealT tauScale_;
+    std::string tauMode_;
+    RealT tauC_;
+    RealT tauDt_;
+    RealT tauAdvMag_;
+    RealT hMin_;
+    RealT hEq_;
+    RealT pGradSign_;
+    RealT pspgRhsSign_;
+};
+
+template <class RealT>
+class StructuredStokesDiagonalPreconditioner {
+public:
+    StructuredStokesDiagonalPreconditioner(const memoirs::structured::StructuredGrid3D& grid,
+                                           RealT nu,
+                                           RealT tau)
+        : grid_(grid), dg_(to_cuda_grid_local(grid)), nu_(nu), tau_(tau) {}
+
+    void apply(const RealT* r, RealT* z) {
+        const int n = grid_.n_nodes();
+        const int block = 256;
+        kernel_stokes_diag_prec<RealT>
+            <<<div_up_local(n, block), block>>>(dg_, nu_, tau_, r, z);
+        MEMOIRS_CUDA_KERNEL_CHECK();
+    }
+
+    void print_audit(std::ostream& os) const {
+        stokes_print_nodal4_diag_audit<RealT>(grid_, dg_, nu_, tau_, os);
+    }
+
+private:
+    memoirs::structured::StructuredGrid3D grid_;
+    Grid3DCudaLocal dg_;
+    RealT nu_;
+    RealT tau_;
+    RealT tauScale_;
+    std::string tauMode_;
+    RealT tauC_;
+    RealT tauDt_;
+    RealT tauAdvMag_;
+    RealT hMin_;
+    RealT hEq_;
+    RealT pGradSign_;
+    RealT pspgRhsSign_;
+};
+
+template <class RealT>
+struct CudaRightBicgstabReportLocal {
+    int iterations = 0;
+    int converged = 0;
+    int breakdown = 0;
+    int breakdownCode = 0;
+    double breakdownValue = 0.0;
+    double initialResidual = 0.0;
+    double finalResidual = 0.0;
+    double finalRelativeResidual = 0.0;
+};
+
+template <class RealT, class Operator, class RightPreconditioner>
+CudaRightBicgstabReportLocal<RealT> bicgstab_right_prec_cuda_local(
+    const Operator& A,
+    RightPreconditioner& M,
+    const RealT* d_b,
+    RealT* d_x,
+    RealT tol,
+    int maxit,
+    int printEvery) {
+
+    const int n = A.size();
+    const int block = 256;
+
+    DeviceBuffer<RealT> d_Ax(static_cast<std::size_t>(n));
+    DeviceBuffer<RealT> d_r(static_cast<std::size_t>(n));
+    DeviceBuffer<RealT> d_rhat(static_cast<std::size_t>(n));
+    DeviceBuffer<RealT> d_p(static_cast<std::size_t>(n));
+    DeviceBuffer<RealT> d_v(static_cast<std::size_t>(n));
+    DeviceBuffer<RealT> d_s(static_cast<std::size_t>(n));
+    DeviceBuffer<RealT> d_t(static_cast<std::size_t>(n));
+    DeviceBuffer<RealT> d_phat(static_cast<std::size_t>(n));
+    DeviceBuffer<RealT> d_shat(static_cast<std::size_t>(n));
+
+    GpuDotLocal<RealT> dots;
+
+    A.apply(d_x, d_Ax.data());
+
+    kernel_subtract_local<RealT><<<div_up_local(n, block), block>>>
+        (n, d_b, d_Ax.data(), d_r.data());
+    MEMOIRS_CUDA_KERNEL_CHECK();
+
+    kernel_copy_local<RealT><<<div_up_local(n, block), block>>>
+        (n, d_r.data(), d_rhat.data());
+    MEMOIRS_CUDA_KERNEL_CHECK();
+
+    d_p.zero();
+    d_v.zero();
+
+    const double bnorm = std::max(std::sqrt(dots.dot(n, d_b, d_b)), 1.0);
+    double rnorm = std::sqrt(dots.dot(n, d_r.data(), d_r.data()));
+
+    CudaRightBicgstabReportLocal<RealT> rep;
+    rep.initialResidual = rnorm;
+    rep.finalResidual = rnorm;
+    rep.finalRelativeResidual = rnorm / bnorm;
+
+    if (rep.finalRelativeResidual <= double(tol)) {
+        rep.converged = 1;
+        return rep;
+    }
+
+    double rhoOld = 1.0;
+    double alpha = 1.0;
+    double omega = 1.0;
+
+    for (int it = 1; it <= maxit; ++it) {
+        const double rhoNew = dots.dot(n, d_rhat.data(), d_r.data());
+        if (!(std::abs(rhoNew) > 0.0)) {
+            rep.breakdown = 1;
+            rep.breakdownCode = 1; // rhoNew = rhat dot r
+            rep.breakdownValue = rhoNew;
+            rep.iterations = it - 1;
+            return rep;
+        }
+
+        const double beta = (rhoNew / rhoOld) * (alpha / omega);
+
+        kernel_combination3_local<RealT><<<div_up_local(n, block), block>>>
+            (n, RealT(1), d_r.data(), RealT(beta), d_p.data(),
+             RealT(-beta * omega), d_v.data(), d_p.data());
+        MEMOIRS_CUDA_KERNEL_CHECK();
+
+        M.apply(d_p.data(), d_phat.data());
+        A.apply(d_phat.data(), d_v.data());
+
+        const double rhatv = dots.dot(n, d_rhat.data(), d_v.data());
+        if (!(std::abs(rhatv) > 0.0)) {
+            rep.breakdown = 1;
+            rep.breakdownCode = 2; // rhat dot v
+            rep.breakdownValue = rhatv;
+            rep.iterations = it - 1;
+            return rep;
+        }
+
+        alpha = rhoNew / rhatv;
+
+        kernel_combination3_local<RealT><<<div_up_local(n, block), block>>>
+            (n, RealT(1), d_r.data(), RealT(-alpha), d_v.data(),
+             RealT(0), d_v.data(), d_s.data());
+        MEMOIRS_CUDA_KERNEL_CHECK();
+
+        const double snorm = std::sqrt(dots.dot(n, d_s.data(), d_s.data()));
+        if (snorm / bnorm <= double(tol)) {
+            kernel_axpby_local<RealT><<<div_up_local(n, block), block>>>
+                (n, RealT(alpha), d_phat.data(), RealT(1), d_x);
+            MEMOIRS_CUDA_KERNEL_CHECK();
+
+            rep.iterations = it;
+            rep.converged = 1;
+            rep.finalResidual = snorm;
+            rep.finalRelativeResidual = snorm / bnorm;
+            return rep;
+        }
+
+        M.apply(d_s.data(), d_shat.data());
+        A.apply(d_shat.data(), d_t.data());
+
+        const double tt = dots.dot(n, d_t.data(), d_t.data());
+        if (!(tt > 0.0)) {
+            rep.breakdown = 1;
+            rep.breakdownCode = 3; // t dot t
+            rep.breakdownValue = tt;
+            rep.iterations = it - 1;
+            return rep;
+        }
+
+        omega = dots.dot(n, d_t.data(), d_s.data()) / tt;
+        if (!(std::abs(omega) > 0.0)) {
+            rep.breakdown = 1;
+            rep.breakdownCode = 4; // omega = (t dot s)/(t dot t)
+            rep.breakdownValue = omega;
+            rep.iterations = it - 1;
+            return rep;
+        }
+
+        kernel_combination3_local<RealT><<<div_up_local(n, block), block>>>
+            (n, RealT(1), d_x, RealT(alpha), d_phat.data(),
+             RealT(omega), d_shat.data(), d_x);
+        MEMOIRS_CUDA_KERNEL_CHECK();
+
+        kernel_combination3_local<RealT><<<div_up_local(n, block), block>>>
+            (n, RealT(1), d_s.data(), RealT(-omega), d_t.data(),
+             RealT(0), d_t.data(), d_r.data());
+        MEMOIRS_CUDA_KERNEL_CHECK();
+
+        rnorm = std::sqrt(dots.dot(n, d_r.data(), d_r.data()));
+
+        rep.iterations = it;
+        rep.finalResidual = rnorm;
+        rep.finalRelativeResidual = rnorm / bnorm;
+
+        if (printEvery > 0 && (it == 1 || it % printEvery == 0)) {
+            std::cout << "cuda stokes right-bicgstab it=" << it
+                      << " rel=" << rep.finalRelativeResidual << "\n";
+        }
+
+        if (rep.finalRelativeResidual <= double(tol)) {
+            rep.converged = 1;
+            return rep;
+        }
+
+        rhoOld = rhoNew;
+    }
+
+    return rep;
+}
+
+template <class RealT, class Operator>
+double device_residual_rel_local(const Operator& A, const RealT* d_b, const RealT* d_x) {
+    const int n = A.size();
+    const int block = 256;
+    DeviceBuffer<RealT> d_Ax(static_cast<std::size_t>(n));
+    DeviceBuffer<RealT> d_r(static_cast<std::size_t>(n));
+    GpuDotLocal<RealT> dots;
+
+    A.apply(d_x, d_Ax.data());
+    kernel_subtract_local<RealT><<<div_up_local(n, block), block>>>
+        (n, d_b, d_Ax.data(), d_r.data());
+    MEMOIRS_CUDA_KERNEL_CHECK();
+
+    const double r = std::sqrt(dots.dot(n, d_r.data(), d_r.data()));
+    const double b = std::max(std::sqrt(dots.dot(n, d_b, d_b)), 1.0);
+    return r / b;
+}
+
+
+template <class RealT, class Operator>
+void print_exact_rhs_defect_local(const Operator& A,
+                                  const RealT* d_b,
+                                  const RealT* d_exact,
+                                  int nn,
+                                  std::ostream& os) {
+    const int n = A.size();
+    const int block = 256;
+
+    DeviceBuffer<RealT> d_Ax(static_cast<std::size_t>(n));
+    DeviceBuffer<RealT> d_def(static_cast<std::size_t>(n));
+    GpuDotLocal<RealT> dots;
+
+    A.apply(d_exact, d_Ax.data());
+
+    // def = A*x_exact_interpolated - b_continuous
+    kernel_subtract_local<RealT><<<div_up_local(n, block), block>>>
+        (n, d_Ax.data(), d_b, d_def.data());
+    MEMOIRS_CUDA_KERNEL_CHECK();
+
+    const double bTotal = std::sqrt(dots.dot(n, d_b, d_b));
+    const double dTotal = std::sqrt(dots.dot(n, d_def.data(), d_def.data()));
+    const double denomTotal = std::max(bTotal, 1.0);
+
+    const double bUx = std::sqrt(dots.dot(nn, d_b, d_b));
+    const double bUy = std::sqrt(dots.dot(nn, d_b + nn, d_b + nn));
+    const double bUz = std::sqrt(dots.dot(nn, d_b + 2 * nn, d_b + 2 * nn));
+    const double bP  = std::sqrt(dots.dot(nn, d_b + 3 * nn, d_b + 3 * nn));
+
+    const double dUx = std::sqrt(dots.dot(nn, d_def.data(), d_def.data()));
+    const double dUy = std::sqrt(dots.dot(nn, d_def.data() + nn, d_def.data() + nn));
+    const double dUz = std::sqrt(dots.dot(nn, d_def.data() + 2 * nn, d_def.data() + 2 * nn));
+    const double dP  = std::sqrt(dots.dot(nn, d_def.data() + 3 * nn, d_def.data() + 3 * nn));
+
+    os << "--------------- stokes exact-RHS consistency audit ---------------\n";
+    os << std::setprecision(17);
+    os << "exactDefectDefinition     = A*x_exact_interpolated_minus_b_continuous\n";
+    os << "rhsNormTotal              = " << bTotal << "\n";
+    os << "exactDefectNormTotal      = " << dTotal << "\n";
+    os << "exactDefectRelTotal       = " << dTotal / denomTotal << "\n";
+
+    os << "rhsNormUx                 = " << bUx << "\n";
+    os << "rhsNormUy                 = " << bUy << "\n";
+    os << "rhsNormUz                 = " << bUz << "\n";
+    os << "rhsNormP                  = " << bP << "\n";
+
+    os << "exactDefectNormUx         = " << dUx << "\n";
+    os << "exactDefectNormUy         = " << dUy << "\n";
+    os << "exactDefectNormUz         = " << dUz << "\n";
+    os << "exactDefectNormP          = " << dP << "\n";
+
+    os << "exactDefectRelUx          = " << dUx / std::max(bUx, 1.0) << "\n";
+    os << "exactDefectRelUy          = " << dUy / std::max(bUy, 1.0) << "\n";
+    os << "exactDefectRelUz          = " << dUz / std::max(bUz, 1.0) << "\n";
+    os << "exactDefectRelP           = " << dP / std::max(bP, 1.0) << "\n";
+    os << "------------------------------------------------------------------\n";
+}
+
+
+} // namespace gpu
+} // namespace memoirs
+
+int main(int argc, char** argv) {
+    GpuMemoryMonitor gpuMemMon;
+
+    try {
+        const Cli cli = parse_cli(argc, argv);
+        gpuMemMon.start();
+
+        using Grid = memoirs::structured::StructuredGrid3D;
+        using Op = memoirs::gpu::StructuredStokesPspgOperator<Real>;
+        using Prec = memoirs::gpu::StructuredStokesDiagonalPreconditioner<Real>;
+
+        const Grid grid(cli.nElem + 1, cli.nElem + 1, cli.nElem + 1);
+        Op A(grid,
+             Real(cli.nu),
+             Real(cli.tauScale),
+             cli.tauMode,
+             Real(cli.tauC),
+             Real(cli.tauDt),
+             Real(cli.tauAdvMag),
+             Real(cli.pGradSign),
+             Real(cli.pspgRhsSign));
+        Prec M(grid, Real(cli.nu), A.tau());
+
+        const int total = A.size();
+
+        memoirs::gpu::DeviceBuffer<Real> d_b(static_cast<std::size_t>(total));
+        memoirs::gpu::DeviceBuffer<Real> d_x(static_cast<std::size_t>(total));
+        memoirs::gpu::DeviceBuffer<Real> d_exact(static_cast<std::size_t>(total));
+
+        A.fill_exact(d_exact.data());
+        if (cli.rhsMode == 0) {
+            A.assemble_rhs_continuous(d_b.data());
+        } else {
+            A.apply(d_exact.data(), d_b.data());
+        }
+
+        std::cout << "Memoirs CUDA structured Q1/Q1 Stokes PSPG MMS test\n";
+        std::cout << "precision                 = " << kPrecisionName << "\n";
+        std::cout << "grid                      = " << grid.label() << "\n";
+        std::cout << "unknowns                  = " << total << "\n";
+        std::cout << "operator                  = monolithic_stokes_pspg_matrix_free\n";
+        std::cout << "mms                       = divergence_free_sine_velocity_sine_pressure\n";
+        std::cout << "velocityBC                = homogeneous_dirichlet_all_faces\n";
+        std::cout << "pressurePin               = node_0_exact_value_0\n";
+        std::cout << "solver                    = right_bicgstab\n";
+        std::cout << "rightPreconditioner       = nodal_4x4_inverse_diagonal\n";
+        std::cout << "rhsMode                   = "
+                  << (cli.rhsMode == 0 ? "continuous_quadrature" : "algebraic_Ax_exact") << "\n";
+        std::cout << "nu                        = " << cli.nu << "\n";
+        std::cout << "tauScale                  = " << cli.tauScale << "\n";
+        std::cout << "tau                       = " << double(A.tau()) << "\n";
+        std::cout << "tol                       = " << cli.tol << "\n";
+        std::cout << "maxit                     = " << cli.maxit << "\n";
+
+        if (cli.rhsMode == 0) {
+            memoirs::gpu::print_exact_rhs_defect_local<Real>(
+                A, d_b.data(), d_exact.data(), grid.n_nodes(), std::cout);
+        }
+
+        M.print_audit(std::cout);
+
+        memoirs::diagnostics::CudaGmgTimingReport timingReport;
+        memoirs::diagnostics::CudaSynchronizedTimer timer;
+        memoirs::gpu::CudaRightBicgstabReportLocal<Real> rep;
+
+        for (int r = 0; r < cli.repeats; ++r) {
+            d_x.zero();
+
+            timer.start();
+            rep = memoirs::gpu::bicgstab_right_prec_cuda_local<Real>(
+                A, M, d_b.data(), d_x.data(), Real(cli.tol), cli.maxit, cli.printEvery);
+            timingReport.solveTotalSeconds += timer.stop_seconds();
+            timingReport.solveRepeats += 1;
+
+            const double checkedRel = memoirs::gpu::device_residual_rel_local(A, d_b.data(), d_x.data());
+
+            std::vector<Real> h_x(static_cast<std::size_t>(total));
+            d_x.copy_to_host(h_x.data(), h_x.size());
+
+            const auto err =
+                memoirs::diagnostics::structured_q1_l2_error_stokes_mms<Real>(grid, h_x);
+
+            std::cout << "--------------- stokes pspg solve report ---------------\n";
+            std::cout << "repeat                    = " << r << "\n";
+            std::cout << "iterations                = " << rep.iterations << "\n";
+            std::cout << "converged                 = " << rep.converged << "\n";
+            std::cout << "breakdown                 = " << rep.breakdown << "\n";
+            std::cout << "breakdownCode             = " << rep.breakdownCode << "\n";
+            std::cout << "breakdownValue            = " << std::setprecision(17) << rep.breakdownValue << "\n";
+            std::cout << std::setprecision(17);
+            std::cout << "initialResidual           = " << rep.initialResidual << "\n";
+            std::cout << "finalResidual             = " << rep.finalResidual << "\n";
+            std::cout << "finalRelativeResidual     = " << rep.finalRelativeResidual << "\n";
+            std::cout << "checkedRelativeResidual   = " << checkedRel << "\n";
+            std::cout << "velocityL2Quadrature      = " << err.velocityL2 << "\n";
+            std::cout << "pressureL2Quadrature      = " << err.pressureL2 << "\n";
+            std::cout << "--------------------------------------------------------\n";
+
+            if (!rep.converged || rep.breakdown) {
+                gpuMemMon.stop();
+                gpuMemMon.print(std::cout);
+                return 2;
+            }
+        }
+
+        if (timingReport.solveRepeats > 0) {
+            timingReport.solveAvgSeconds =
+                timingReport.solveTotalSeconds / double(timingReport.solveRepeats);
+        }
+
+        timingReport.print(std::cout);
+        gpuMemMon.stop();
+        gpuMemMon.print(std::cout);
+
+        return 0;
+    } catch (const std::exception& e) {
+        gpuMemMon.stop();
+        gpuMemMon.print(std::cout);
+        std::cerr << "FATAL: " << e.what() << "\n";
+        return 1;
+    }
+}

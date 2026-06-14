@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="${MEMOIRS_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+HEX_ROOT="${HEX_ROOT:-/home/jd/Desktop/meshes/unitcube/blockmesh}"
+TET_ROOT="${TET_ROOT:-/home/jd/Desktop/meshes/unitcube/tetmesh}"
+HYPRE_DOUBLE_ROOT="${HYPRE_DOUBLE_ROOT:-/home/jd/opt/hypre-cuda-double-clean}"
+HYPRE_SINGLE_ROOT="${HYPRE_SINGLE_ROOT:-/home/jd/opt/hypre-cuda-single-clean}"
+LOG_DIR="${LOG_DIR:-$ROOT/logs/mms}"
+mkdir -p "$LOG_DIR"
+
+build_one() {
+  local prec="$1"
+  local hroot="$2"
+  local bdir="$ROOT/build_${prec}_hypre"
+  cmake -S "$ROOT" -B "$bdir" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DMEMOIRS_PRECISION="$([[ "$prec" == dp ]] && echo double || echo single)" \
+    -DMEMOIRS_USE_HYPRE=ON \
+    -DMEMOIRS_BUILD_EXPERIMENTS="${MEMOIRS_BUILD_EXPERIMENTS:-OFF}" \
+    -DCMAKE_CUDA_ARCHITECTURES="${CMAKE_CUDA_ARCHITECTURES:-86}" \
+    -DHYPRE_ROOT="$hroot"
+  cmake --build "$bdir" --target memoirs_poisson_mms -j "${BUILD_JOBS:-8}"
+}
+
+run_case() {
+  local prec="$1"
+  local hroot="$2"
+  local meshroot="$3"
+  local family="$4"
+  local space="$5"
+  local N="$6"
+  local tol="$7"
+  local bdir="$ROOT/build_${prec}_hypre"
+  local exe="$bdir/memoirs_q1_poisson_oneshot"
+  local mesh="$meshroot/${N}cube/constant/polyMesh"
+
+  if [[ ! -f "$mesh/points" ]]; then
+    echo "SKIP ${prec} ${family} ${N}cube: $mesh/points not found"
+    return 0
+  fi
+
+  echo "============================================================"
+  echo "${prec^^} ${family} MMS ${N}cube"
+  echo "============================================================"
+
+  export LD_LIBRARY_PATH="$hroot/lib:${LD_LIBRARY_PATH:-}"
+  export MEMOIRS_STAGE_TIMERS=1
+  unset MEMOIRS_COMPUTE_ERROR
+  unset MEMOIRS_SOLVE_REPEATS
+  unset MEMOIRS_RHS_UPDATE_MODE
+
+  export MEMOIRS_AMG_COARSEN=8
+  export MEMOIRS_AMG_INTERP=6
+  export MEMOIRS_AMG_RELAX=18
+  export MEMOIRS_AMG_AGG_LEVELS=0
+  export MEMOIRS_AMG_KEEP_TRANSPOSE=1
+  export MEMOIRS_AMG_PMAX=4
+  export MEMOIRS_AMG_SWEEPS=1
+  export MEMOIRS_AMG_STRONG=-1
+  export MEMOIRS_AMG_TRUNC=0
+  export MEMOIRS_AMG_RAP2=0
+  export MEMOIRS_IJ_ROW_SIZES=1
+  export MEMOIRS_IJ_BULK_INSERT=1
+
+  "$exe" \
+    -polyMeshDir "$mesh" \
+    -space "$space" \
+    -mms sin \
+    -solve 1 \
+    -solver pcg \
+    -precond amg \
+    -hypreMemory device \
+    -tol "$tol" \
+    -maxit 1000 \
+    -diagLevel 0 \
+    -hyprePrint 0 \
+    2>&1 | tee "$LOG_DIR/${family}_${N}_${prec}_mms.log"
+}
+
+build_one dp "$HYPRE_DOUBLE_ROOT"
+build_one sp "$HYPRE_SINGLE_ROOT"
+
+for prec in dp sp; do
+  if [[ "$prec" == dp ]]; then
+    hroot="$HYPRE_DOUBLE_ROOT"
+    tol="1e-10"
+  else
+    hroot="$HYPRE_SINGLE_ROOT"
+    tol="1e-6"
+  fi
+
+  for N in 16 24 32 64; do
+    run_case "$prec" "$hroot" "$HEX_ROOT" hex cg_hex_q1 "$N" "$tol"
+  done
+
+  for N in 16 24 32 64; do
+    run_case "$prec" "$hroot" "$TET_ROOT" tet cg_tet_p1 "$N" "$tol"
+  done
+done
+
+"$ROOT/tools/compute_mms_orders.py" "$LOG_DIR" | tee "$LOG_DIR/orders_summary.txt"
