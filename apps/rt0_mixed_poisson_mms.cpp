@@ -2,6 +2,7 @@
 #include "memoirs/sections/01_options.hpp"
 #include "memoirs/sections/02_polymesh.hpp"
 #include "memoirs/sections/03_cell_topology.hpp"
+#include "memoirs/sections/03a_topology_tables.hpp"
 #include "memoirs/sections/04_reference_elements.hpp"
 #include "memoirs/sections/04a_quadrature.hpp"
 #include "memoirs/sections/04b_basis.hpp"
@@ -11,6 +12,7 @@
 #include "memoirs/sections/08a_boundary_conditions.hpp"
 #include "memoirs/sections/08_laplacian_assembler.hpp"
 #include "memoirs/sections/09_hypre_solver.hpp"
+#include "memoirs/sections/09a_hypre_raw_solver.hpp"
 #include "memoirs/sections/09b_hypre_gmres_raw.hpp"
 #include "memoirs/sections/10_scalar_elliptic_spec.hpp"
 #include "memoirs/sections/16_rt0_mixed_poisson.hpp"
@@ -53,6 +55,7 @@ int main(int argc, char** argv) {
 
         if (opt.probeMesh) {
             probe_mesh(mesh);
+            probe_memoirs_topology_tables(mesh);
         }
 
         if (lower_copy(opt.precond) == "diagscale") {
@@ -97,7 +100,17 @@ int main(int argc, char** argv) {
                 std::vector<Real> x;
 
                 auto tSol0 = std::chrono::steady_clock::now();
-                SolveReport rep = solve_hypre_ij_gmres_raw(sys.A, sys.b, opt, x);
+                const std::string rt0SolveMode = memoirs_rt0_solve_mode();
+                SolveReport rep;
+                if (rt0SolveMode == "gmres") {
+                    rep = solve_hypre_ij_gmres_raw(sys.A, sys.b, opt, x);
+                } else if (rt0SolveMode == "lumped_schur") {
+                    rep = solve_rt0_lumped_schur_approx(mesh, dm, sys, opt, x);
+                } else if (rt0SolveMode == "block_schur_gmres") {
+                    rep = solve_rt0_block_schur_fgmres(mesh, dm, sys, opt, x);
+                } else {
+                    throw std::runtime_error("Unsupported MEMOIRS_RT0_SOLVE_MODE: " + rt0SolveMode);
+                }
                 auto tErr0 = std::chrono::steady_clock::now();
                 Rt0ErrorReport er = compute_rt0_mixed_errors(mesh, dm, opt.mms, x);
 
@@ -117,7 +130,11 @@ int main(int argc, char** argv) {
                 std::cout << "nFluxDofs                     = " << dm.nFluxDofs << "\n";
                 std::cout << "nScalarDofs                   = " << dm.nScalarDofs << "\n";
                 std::cout << "nTotalDofs                    = " << dm.nTotalDofs << "\n";
-                std::cout << "solver                        = gmres\n";
+                std::cout << "rt0SolveMode                 = " << rt0SolveMode << "\n";
+                std::cout << "solver                        = "
+                          << (rt0SolveMode == "gmres" ? "gmres" :
+                              (rt0SolveMode == "lumped_schur" ? "pcg_on_lumped_schur" :
+                               "host_fgmres_block_schur")) << "\n";
                 std::cout << "precond                       = " << opt.precond << "\n";
                 std::cout << "iterations                    = " << rep.iterations << "\n";
                 std::cout << "finalRelativeResidual         = " << std::scientific << rep.finalRelRes << std::defaultfloat << "\n";

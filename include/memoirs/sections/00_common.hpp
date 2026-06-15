@@ -54,6 +54,18 @@ static Vec3 operator-(const Vec3& a, const Vec3& b) {
     return {a.x - b.x, a.y - b.y, a.z - b.z};
 }
 
+static Vec3 operator+(const Vec3& a, const Vec3& b) {
+    return {a.x + b.x, a.y + b.y, a.z + b.z};
+}
+
+static Vec3 operator*(double s, const Vec3& a) {
+    return {s*a.x, s*a.y, s*a.z};
+}
+
+static Vec3 operator*(const Vec3& a, double s) {
+    return {s*a.x, s*a.y, s*a.z};
+}
+
 static Vec3 cross3(const Vec3& a, const Vec3& b) {
     return {
         a.y*b.z - a.z*b.y,

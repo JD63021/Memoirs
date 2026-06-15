@@ -5,6 +5,7 @@
 #include "memoirs/sections/01_options.hpp"
 #include "memoirs/sections/02_polymesh.hpp"
 #include "memoirs/sections/03_cell_topology.hpp"
+#include "memoirs/sections/03a_topology_tables.hpp"
 #include "memoirs/sections/04_reference_elements.hpp"
 #include "memoirs/sections/04a_quadrature.hpp"
 #include "memoirs/sections/04b_basis.hpp"
@@ -68,6 +69,7 @@ int main(int argc, char** argv) {
 
         if (opt.probeMesh) {
             probe_mesh(mesh);
+            probe_memoirs_topology_tables(mesh);
         }
 
         if (opt.probeDofs) {
@@ -83,10 +85,12 @@ int main(int argc, char** argv) {
             } else if (scalarSpec.boundary.mode == ScalarBoundaryMode::WeakNitsche) {
                 if (dm.resolvedSpace == "cg_tet_p1") {
                     sys = assemble_cg_tet_p1_nitsche_poisson_mms(mesh, dm, opt.mms, scalarSpec);
+                } else if (dm.resolvedSpace == "cg_tet_p2") {
+                    sys = assemble_cg_tet_p2_nitsche_poisson_mms(mesh, dm, opt.mms, scalarSpec);
                 } else if (dm.resolvedSpace == "cg_hex_q1") {
                     sys = assemble_cg_hex_q1_nitsche_poisson_mms(mesh, dm, opt.mms, scalarSpec);
                 } else {
-                    throw std::runtime_error("CG Nitsche supports cg_tet_p1 and cg_hex_q1.");
+                    throw std::runtime_error("CG Nitsche supports cg_tet_p1, cg_tet_p2, and cg_hex_q1.");
                 }
             } else {
                 throw std::runtime_error("CG Poisson app supports -bc strong or -bc nitsche.");
@@ -117,10 +121,12 @@ int main(int argc, char** argv) {
             } else if (scalarSpec.boundary.mode == ScalarBoundaryMode::WeakNitsche) {
                 if (dm.resolvedSpace == "cg_tet_p1") {
                     sys = assemble_cg_tet_p1_nitsche_poisson_mms(mesh, dm, opt.mms, scalarSpec);
+                } else if (dm.resolvedSpace == "cg_tet_p2") {
+                    sys = assemble_cg_tet_p2_nitsche_poisson_mms(mesh, dm, opt.mms, scalarSpec);
                 } else if (dm.resolvedSpace == "cg_hex_q1") {
                     sys = assemble_cg_hex_q1_nitsche_poisson_mms(mesh, dm, opt.mms, scalarSpec);
                 } else {
-                    throw std::runtime_error("CG Nitsche supports cg_tet_p1 and cg_hex_q1.");
+                    throw std::runtime_error("CG Nitsche supports cg_tet_p1, cg_tet_p2, and cg_hex_q1.");
                 }
             } else {
                 throw std::runtime_error("CG Poisson app supports -bc strong or -bc nitsche.");

@@ -194,6 +194,13 @@ static inline std::vector<std::vector<int>> build_scalar_cg_cell_row_columns(
             std::vector<int> dofs = {c.verts[0], c.verts[1], c.verts[2], c.verts[3]};
             add_clique(dofs);
         }
+    } else if (dm.resolvedSpace == "cg_tet_p2") {
+        for (const auto& dofs : dm.cellDofs) {
+            if (dofs.size() != 10) {
+                throw std::runtime_error("CG tet P2 sparsity builder found non-10-dof cell.");
+            }
+            add_clique(dofs);
+        }
     } else {
         throw std::runtime_error("CG sparsity builder unsupported for space: " + dm.resolvedSpace);
     }

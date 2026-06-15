@@ -154,6 +154,7 @@ struct SolveReport {
 
 static void compute_nodal_error(
     const PolyMesh& m,
+    const LinearCgDofMap& dm,
     const std::string& mms,
     const std::vector<Real>& x,
     SolveReport& rep
@@ -161,7 +162,7 @@ static void compute_nodal_error(
     double e2 = 0.0;
     double emax = 0.0;
     for (int i = 0; i < (int)x.size(); ++i) {
-        const double ex = mms_exact_value(m.points[i], mms);
+        const double ex = mms_exact_value(cg_dof_coordinate(m, dm, i), mms);
         const double e = double(x[i]) - ex;
         e2 += e*e;
         emax = std::max(emax, std::abs(e));
@@ -182,7 +183,7 @@ static ErrorNorms compute_error_norms(
     double nodal2 = 0.0;
     double nodalMax = 0.0;
     for (int i = 0; i < (int)x.size(); ++i) {
-        const double ex = mms_exact_value(m.points[i], mms);
+        const double ex = mms_exact_value(cg_dof_coordinate(m, dm, i), mms);
         const double e = double(x[i]) - ex;
         nodal2 += e*e;
         nodalMax = std::max(nodalMax, std::abs(e));
@@ -264,6 +265,42 @@ static ErrorNorms compute_error_norms(
                 h1 += qpt.weight * detJ * dot3(eg, eg);
             }
         }
+    } else if (dm.resolvedSpace == "cg_tet_p2") {
+        for (int cidx = 0; cidx < (int)m.cells.size(); ++cidx) {
+            const auto& c = m.cells[cidx];
+            if (c.verts.size() != 4) throw std::runtime_error("Tet P2 error norm cell does not have 4 vertices.");
+            if (dm.cellDofs[cidx].size() != 10) throw std::runtime_error("Tet P2 error norm cell does not have 10 dofs.");
+
+            std::array<int,4> tv = {c.verts[0], c.verts[1], c.verts[2], c.verts[3]};
+            const Mat3 J = jacobian_tet_p1(m, tv);
+            const double detJ = std::abs(det3(J));
+            const Mat3 invJ = inv3(J);
+
+            for (const auto& qpt : tet_volume_quadrature_by_order(4)) {
+                const TetP2BasisAtPoint basis = eval_tet_p2_basis_at(qpt.xi, qpt.eta, qpt.zeta);
+                const TetP1BasisAtPoint geomBasis = eval_tet_p1_basis_at(qpt.xi, qpt.eta, qpt.zeta);
+                const Vec3 xq = map_tet_p1_to_physical(m, tv, geomBasis.N);
+
+                double uh = 0.0;
+                Vec3 guh;
+                for (int aLoc = 0; aLoc < 10; ++aLoc) {
+                    const double xa = double(x[dm.cellDofs[cidx][aLoc]]);
+                    uh += basis.N[aLoc] * xa;
+                    const Vec3 g = invJT_mul(invJ, basis.dNref[aLoc]);
+                    guh.x += xa * g.x;
+                    guh.y += xa * g.y;
+                    guh.z += xa * g.z;
+                }
+
+                const double ue = mms_exact_value(xq, mms);
+                const Vec3 ge = mms_exact_grad(xq, mms);
+                const double eu = uh - ue;
+                const Vec3 eg = {guh.x - ge.x, guh.y - ge.y, guh.z - ge.z};
+
+                l2 += qpt.weight * detJ * eu * eu;
+                h1 += qpt.weight * detJ * dot3(eg, eg);
+            }
+        }
     } else {
         throw std::runtime_error("Error norm unsupported for space: " + dm.resolvedSpace);
     }
@@ -281,6 +318,41 @@ static void hypre_check(int ierr, const std::string& where) {
         oss << "HYPRE error " << ierr << " at " << where;
         throw std::runtime_error(oss.str());
     }
+}
+
+
+static inline bool memoirs_allow_hypre_solve_error_256() {
+    const char* v = std::getenv("MEMOIRS_ALLOW_HYPRE_ERROR_256");
+    if (!v) return false;
+    std::string s(v);
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c){ return char(std::tolower(c)); });
+    return !(s.empty() || s == "0" || s == "false" || s == "off" || s == "no");
+}
+
+static inline void hypre_check_pcg_solve(int ierr, const std::string& where) {
+    if (!ierr) return;
+    if (ierr == 256 && memoirs_allow_hypre_solve_error_256()) {
+        std::cerr << "WARNING: HYPRE returned error/status 256 at " << where
+                  << "; continuing because MEMOIRS_ALLOW_HYPRE_ERROR_256=1.\n";
+        // HYPRE stores error flags globally; clear them so follow-up getter calls
+        // such as HYPRE_PCGGetNumIterations do not fail only because the solve
+        // reported non-convergence/status 256.
+        HYPRE_ClearAllErrors();
+        return;
+    }
+    hypre_check(ierr, where);
+}
+
+static inline void hypre_check_pcg_getter(int ierr, const std::string& where) {
+    if (!ierr) return;
+    if (memoirs_allow_hypre_solve_error_256()) {
+        std::cerr << "WARNING: HYPRE getter returned error/status " << ierr
+                  << " at " << where
+                  << "; clearing and continuing because MEMOIRS_ALLOW_HYPRE_ERROR_256=1.\n";
+        HYPRE_ClearAllErrors();
+        return;
+    }
+    hypre_check(ierr, where);
 }
 
 static HYPRE_MemoryLocation parse_hypre_memory_location(const std::string& s) {
@@ -323,9 +395,12 @@ static SolveReport solve_hypre_ij_pcg(
     const Options& opt,
     std::vector<Real>& xOut
 ) {
-    if (lower_copy(opt.solver) != "pcg") {
-        throw std::runtime_error("Patch 004 supports only -solver pcg");
+    const std::string solverName = lower_copy(opt.solver);
+    if (!(solverName == "pcg" || solverName == "gmres")) {
+        throw std::runtime_error("Supported -solver values in scalar HYPRE path: pcg, gmres");
     }
+    const bool useGmres = (solverName == "gmres");
+    const int gmresRestart = memoirs_env_int("MEMOIRS_GMRES_RESTART", 80);
 
     SolveReport rep;
     const bool computeError = memoirs_compute_error_enabled();
@@ -597,24 +672,54 @@ static SolveReport solve_hypre_ij_pcg(
     // ----------------------------------------------------------------------
     auto tSetup0 = std::chrono::steady_clock::now();
 
-    HYPRE_Solver pcg = nullptr;
-    hypre_check(HYPRE_ParCSRPCGCreate(comm, &pcg), "HYPRE_ParCSRPCGCreate");
-    hypre_check(HYPRE_PCGSetMaxIter(pcg, opt.maxit), "HYPRE_PCGSetMaxIter");
-    hypre_check(HYPRE_PCGSetTol(pcg, opt.tol), "HYPRE_PCGSetTol");
-    hypre_check(HYPRE_PCGSetTwoNorm(pcg, 1), "HYPRE_PCGSetTwoNorm");
-    hypre_check(HYPRE_PCGSetPrintLevel(pcg, opt.hyprePrint), "HYPRE_PCGSetPrintLevel");
-    hypre_check(HYPRE_PCGSetLogging(pcg, 1), "HYPRE_PCGSetLogging");
+    HYPRE_Solver krylov = nullptr;
+    if (useGmres) {
+        hypre_check(HYPRE_ParCSRGMRESCreate(comm, &krylov),
+                    "HYPRE_ParCSRGMRESCreate");
+        hypre_check(HYPRE_GMRESSetMaxIter(krylov, opt.maxit),
+                    "HYPRE_GMRESSetMaxIter");
+        hypre_check(HYPRE_GMRESSetTol(krylov, opt.tol),
+                    "HYPRE_GMRESSetTol");
+        hypre_check(HYPRE_GMRESSetKDim(krylov, gmresRestart),
+                    "HYPRE_GMRESSetKDim");
+        hypre_check(HYPRE_GMRESSetPrintLevel(krylov, opt.hyprePrint),
+                    "HYPRE_GMRESSetPrintLevel");
+        hypre_check(HYPRE_GMRESSetLogging(krylov, 1),
+                    "HYPRE_GMRESSetLogging");
+    } else {
+        hypre_check(HYPRE_ParCSRPCGCreate(comm, &krylov),
+                    "HYPRE_ParCSRPCGCreate");
+        hypre_check(HYPRE_PCGSetMaxIter(krylov, opt.maxit),
+                    "HYPRE_PCGSetMaxIter");
+        hypre_check(HYPRE_PCGSetTol(krylov, opt.tol),
+                    "HYPRE_PCGSetTol");
+        hypre_check(HYPRE_PCGSetTwoNorm(krylov, 1),
+                    "HYPRE_PCGSetTwoNorm");
+        hypre_check(HYPRE_PCGSetPrintLevel(krylov, opt.hyprePrint),
+                    "HYPRE_PCGSetPrintLevel");
+        hypre_check(HYPRE_PCGSetLogging(krylov, 1),
+                    "HYPRE_PCGSetLogging");
+    }
 
     HYPRE_Solver precond = nullptr;
     const std::string pre = lower_copy(opt.precond);
 
     if (pre == "diagscale") {
-        hypre_check(HYPRE_PCGSetPrecond(
-            pcg,
-            (HYPRE_PtrToSolverFcn)HYPRE_ParCSRDiagScale,
-            (HYPRE_PtrToSolverFcn)HYPRE_ParCSRDiagScaleSetup,
-            nullptr),
-            "HYPRE_PCGSetPrecond DiagScale");
+        if (useGmres) {
+            hypre_check(HYPRE_GMRESSetPrecond(
+                krylov,
+                (HYPRE_PtrToSolverFcn)HYPRE_ParCSRDiagScale,
+                (HYPRE_PtrToSolverFcn)HYPRE_ParCSRDiagScaleSetup,
+                nullptr),
+                "HYPRE_GMRESSetPrecond DiagScale");
+        } else {
+            hypre_check(HYPRE_PCGSetPrecond(
+                krylov,
+                (HYPRE_PtrToSolverFcn)HYPRE_ParCSRDiagScale,
+                (HYPRE_PtrToSolverFcn)HYPRE_ParCSRDiagScaleSetup,
+                nullptr),
+                "HYPRE_PCGSetPrecond DiagScale");
+        }
     } else if (pre == "amg" || pre == "boomeramg") {
         hypre_check(HYPRE_BoomerAMGCreate(&precond), "HYPRE_BoomerAMGCreate");
         hypre_check(HYPRE_BoomerAMGSetPrintLevel(precond, opt.hyprePrint),
@@ -656,20 +761,34 @@ static SolveReport solve_hypre_ij_pcg(
                         "HYPRE_BoomerAMGSetStrongThreshold");
         }
 
-        hypre_check(HYPRE_PCGSetPrecond(
-            pcg,
-            (HYPRE_PtrToSolverFcn)HYPRE_BoomerAMGSolve,
-            (HYPRE_PtrToSolverFcn)HYPRE_BoomerAMGSetup,
-            precond),
-            "HYPRE_PCGSetPrecond BoomerAMG");
+        if (useGmres) {
+            hypre_check(HYPRE_GMRESSetPrecond(
+                krylov,
+                (HYPRE_PtrToSolverFcn)HYPRE_BoomerAMGSolve,
+                (HYPRE_PtrToSolverFcn)HYPRE_BoomerAMGSetup,
+                precond),
+                "HYPRE_GMRESSetPrecond BoomerAMG");
+        } else {
+            hypre_check(HYPRE_PCGSetPrecond(
+                krylov,
+                (HYPRE_PtrToSolverFcn)HYPRE_BoomerAMGSolve,
+                (HYPRE_PtrToSolverFcn)HYPRE_BoomerAMGSetup,
+                precond),
+                "HYPRE_PCGSetPrecond BoomerAMG");
+        }
     } else if (pre == "none") {
         // no preconditioner
     } else {
         throw std::runtime_error("Unsupported -precond: " + opt.precond);
     }
 
-    hypre_check(HYPRE_ParCSRPCGSetup(pcg, parA, parb, parx),
-                "HYPRE_ParCSRPCGSetup");
+    if (useGmres) {
+        hypre_check(HYPRE_ParCSRGMRESSetup(krylov, parA, parb, parx),
+                    "HYPRE_ParCSRGMRESSetup");
+    } else {
+        hypre_check(HYPRE_ParCSRPCGSetup(krylov, parA, parb, parx),
+                    "HYPRE_ParCSRPCGSetup");
+    }
 
     auto tSetup1 = std::chrono::steady_clock::now();
     rep.hypreSetupSeconds = elapsed(tSetup0, tSetup1);
@@ -750,8 +869,13 @@ static SolveReport solve_hypre_ij_pcg(
         hypre_check(HYPRE_ParVectorSetConstantValues(parx, HYPRE_Complex(0)),
                     "HYPRE_ParVectorSetConstantValues x=0");
 
-        hypre_check(HYPRE_ParCSRPCGSolve(pcg, parA, parb, parx),
-                    "HYPRE_ParCSRPCGSolve");
+        if (useGmres) {
+            hypre_check_pcg_solve(HYPRE_ParCSRGMRESSolve(krylov, parA, parb, parx),
+                                  "HYPRE_ParCSRGMRESSolve");
+        } else {
+            hypre_check_pcg_solve(HYPRE_ParCSRPCGSolve(krylov, parA, parb, parx),
+                                  "HYPRE_ParCSRPCGSolve");
+        }
     }
 
     auto tSolve1 = std::chrono::steady_clock::now();
@@ -760,11 +884,11 @@ static SolveReport solve_hypre_ij_pcg(
     rep.rhsUpdateSeconds = rhsUpdateAccum;
     rep.rhsUpdateAvgSeconds = rhsUpdateAccum / double(solveRepeats);
 
-    hypre_check(HYPRE_PCGGetNumIterations(pcg, &rep.iterations),
-                "HYPRE_PCGGetNumIterations");
+    hypre_check_pcg_getter(HYPRE_PCGGetNumIterations(krylov, &rep.iterations),
+                           "HYPRE_PCGGetNumIterations");
     HYPRE_Real finalRel = 0;
-    hypre_check(HYPRE_PCGGetFinalRelativeResidualNorm(pcg, &finalRel),
-                "HYPRE_PCGGetFinalRelativeResidualNorm");
+    hypre_check_pcg_getter(HYPRE_PCGGetFinalRelativeResidualNorm(krylov, &finalRel),
+                           "HYPRE_PCGGetFinalRelativeResidualNorm");
     rep.finalRelRes = double(finalRel);
 
     // ----------------------------------------------------------------------
@@ -802,7 +926,7 @@ static SolveReport solve_hypre_ij_pcg(
 
         auto tErr0 = std::chrono::steady_clock::now();
 
-        compute_nodal_error(m, mms, xOut, rep);
+        compute_nodal_error(m, dm, mms, xOut, rep);
         ErrorNorms en = compute_error_norms(m, dm, mms, xOut);
         rep.L2Error = en.L2;
         rep.H1SemiError = en.H1Semi;
@@ -828,7 +952,13 @@ static SolveReport solve_hypre_ij_pcg(
     if (precond) {
         hypre_check(HYPRE_BoomerAMGDestroy(precond), "HYPRE_BoomerAMGDestroy");
     }
-    hypre_check(HYPRE_ParCSRPCGDestroy(pcg), "HYPRE_ParCSRPCGDestroy");
+    if (useGmres) {
+        hypre_check(HYPRE_ParCSRGMRESDestroy(krylov),
+                    "HYPRE_ParCSRGMRESDestroy");
+    } else {
+        hypre_check(HYPRE_ParCSRPCGDestroy(krylov),
+                    "HYPRE_ParCSRPCGDestroy");
+    }
     hypre_check(HYPRE_IJVectorDestroy(ijb), "HYPRE_IJVectorDestroy b");
     hypre_check(HYPRE_IJVectorDestroy(ijx), "HYPRE_IJVectorDestroy x");
     hypre_check(HYPRE_IJMatrixDestroy(ijA), "HYPRE_IJMatrixDestroy A");

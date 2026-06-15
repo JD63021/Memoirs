@@ -2,6 +2,7 @@
 #include "memoirs/sections/01_options.hpp"
 #include "memoirs/sections/02_polymesh.hpp"
 #include "memoirs/sections/03_cell_topology.hpp"
+#include "memoirs/sections/03a_topology_tables.hpp"
 #include "memoirs/sections/04_reference_elements.hpp"
 #include "memoirs/sections/04a_quadrature.hpp"
 #include "memoirs/sections/04b_basis.hpp"
@@ -54,6 +55,7 @@ int main(int argc, char** argv) {
 
         if (opt.probeMesh) {
             probe_mesh(mesh);
+            probe_memoirs_topology_tables(mesh);
         }
 
         DgHexQ1DofMap dm = build_dg_hex_q1_dof_map(mesh);
