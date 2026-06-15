@@ -653,3 +653,51 @@ if(MEMOIRS_USE_HYPRE)
   endif()
 endif()
 
+
+# RT1/DG1 mixed H(div) Poisson MMS target.
+add_executable(memoirs_rt1_mixed_poisson_mms apps/rt1_mixed_poisson_mms.cpp)
+set_target_properties(memoirs_rt1_mixed_poisson_mms PROPERTIES OUTPUT_NAME memoirs_rt1_mixed_poisson_mms)
+
+target_include_directories(memoirs_rt1_mixed_poisson_mms PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+target_compile_definitions(memoirs_rt1_mixed_poisson_mms PRIVATE
+  MEMOIRS_PRECISION_${MEMOIRS_PRECISION}
+)
+
+target_compile_options(memoirs_rt1_mixed_poisson_mms PRIVATE
+  -Wall -Wextra
+)
+
+target_link_libraries(memoirs_rt1_mixed_poisson_mms PRIVATE
+  Threads::Threads
+  dl
+)
+
+if(MEMOIRS_USE_HYPRE)
+  target_compile_definitions(memoirs_rt1_mixed_poisson_mms PRIVATE
+    MEMOIRS_USE_HYPRE=1
+  )
+
+  target_include_directories(memoirs_rt1_mixed_poisson_mms PRIVATE
+    ${HYPRE_INCLUDE_DIR}
+  )
+
+  target_link_libraries(memoirs_rt1_mixed_poisson_mms PRIVATE
+    MPI::MPI_CXX
+    ${HYPRE_LIBRARY}
+    m
+    dl
+  )
+
+  if(TARGET CUDA::cudart)
+    target_link_libraries(memoirs_rt1_mixed_poisson_mms PRIVATE
+      CUDA::cudart
+      CUDA::cusparse
+      CUDA::cublas
+      CUDA::curand
+    )
+  endif()
+endif()
+

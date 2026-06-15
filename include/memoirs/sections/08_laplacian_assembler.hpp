@@ -110,6 +110,56 @@ static void assemble_tet_p1_cell(
     }
 }
 
+
+static void assemble_tet_p2_cell(
+    const PolyMesh& m,
+    const Cell& c,
+    const std::vector<int>& dofs,
+    const std::string& mms,
+    SparseRows& A,
+    std::vector<Real>& b
+) {
+    if (c.verts.size() != 4) throw std::runtime_error("Tet P2 cell does not have 4 vertices.");
+    if (dofs.size() != 10) throw std::runtime_error("Tet P2 cell does not have 10 dofs.");
+
+    std::array<int,4> tv = {c.verts[0], c.verts[1], c.verts[2], c.verts[3]};
+
+    const Mat3 J = jacobian_tet_p1(m, tv);
+    const double detJabs = std::abs(det3(J));
+    const Mat3 invJ = inv3(J);
+
+    Real Ke[10][10] = {};
+    Real Fe[10] = {};
+
+    for (const auto& qpt : tet_volume_quadrature_by_order(4)) {
+        const TetP2BasisAtPoint basis = eval_tet_p2_basis_at(qpt.xi, qpt.eta, qpt.zeta);
+        const TetP1BasisAtPoint geomBasis = eval_tet_p1_basis_at(qpt.xi, qpt.eta, qpt.zeta);
+        const Vec3 xq = map_tet_p1_to_physical(m, tv, geomBasis.N);
+        const double f = mms_rhs_value(xq, mms);
+        const double wdet = qpt.weight * detJabs;
+
+        std::array<Vec3,10> grad;
+        for (int a = 0; a < 10; ++a) {
+            grad[a] = invJT_mul(invJ, basis.dNref[a]);
+        }
+
+        for (int a = 0; a < 10; ++a) {
+            Fe[a] += Real(basis.N[a] * f * wdet);
+            for (int bb = 0; bb < 10; ++bb) {
+                Ke[a][bb] += Real(dot3(grad[a], grad[bb]) * wdet);
+            }
+        }
+    }
+
+    for (int a = 0; a < 10; ++a) {
+        const int I = dofs[a];
+        b[I] += Fe[a];
+        for (int bb = 0; bb < 10; ++bb) {
+            sparse_add(A, I, dofs[bb], Ke[a][bb]);
+        }
+    }
+}
+
 static void apply_dirichlet_all_boundary(
     const PolyMesh& m,
     const LinearCgDofMap& dm,
@@ -345,6 +395,15 @@ static void assemble_cg_laplacian_volume_mms(
         for (const auto& c : m.cells) {
             assemble_tet_p1_cell(m, c, mms, A, b);
         }
+    } else if (dm.resolvedSpace == "cg_tet_p2") {
+        if (assemblyMode != "generic") {
+            throw std::runtime_error("MEMOIRS_ASSEMBLY_MODE=" + assemblyMode +
+                                     " is only implemented for cg_hex_q1 block meshes. Use generic for tet P2.");
+        }
+
+        for (int c = 0; c < (int)m.cells.size(); ++c) {
+            assemble_tet_p2_cell(m, m.cells[c], dm.cellDofs[c], mms, A, b);
+        }
     } else {
         throw std::runtime_error("Assembly unsupported for space: " + dm.resolvedSpace);
     }
@@ -421,7 +480,7 @@ static void probe_assembled_system(
 
     std::vector<Real> xExact(n, Real(0));
     for (int i = 0; i < n; ++i) {
-        xExact[i] = Real(mms_exact_value(m.points[i], mms));
+        xExact[i] = Real(mms_exact_value(cg_dof_coordinate(m, dm, i), mms));
     }
 
     double resL2 = 0.0;
